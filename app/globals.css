@@ -1,0 +1,140 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* =========================================================
+   CINEMATIC DESIGN SYSTEM & COLOR TOKENS
+   Futuristic AI Studio / Luxury Technology Environment
+========================================================= */
+
+:root {
+  /* Cinematic Dark Environment (Primary) */
+  --background: #05070a;
+  --surface: #080b10;
+  --surface-elevated: #0d1117;
+  --surface-glass: rgba(13, 17, 23, 0.72);
+
+  --border: rgba(255, 255, 255, 0.08);
+  --border-glow: rgba(0, 229, 255, 0.3);
+
+  --text-primary: #f5f7fa;
+  --text-secondary: #c4d1e2;
+  --text-muted: #7e8c9f;
+
+  --accent-cyan: #00e5ff;
+  --accent-cyan-soft: rgba(0, 229, 255, 0.12);
+
+  --accent-lime: #b8ff00;
+  --accent-lime-soft: rgba(184, 255, 0, 0.12);
+
+  --accent-violet: #8b5cf6;
+  --accent-violet-soft: rgba(139, 92, 246, 0.12);
+
+  --glow-shadow: 0 12px 40px 0 rgba(0, 229, 255, 0.12);
+
+  --font-sans: var(--font-geist), system-ui, -apple-system, sans-serif;
+  --font-serif: var(--font-cormorant), "Times New Roman", Georgia, serif;
+  --font-mono: var(--font-geist-mono), monospace;
+}
+
+.site[data-theme="light"] {
+  --background: #080b10;
+  --surface: #0d1117;
+  --surface-elevated: #121821;
+  --surface-glass: rgba(18, 24, 33, 0.75);
+
+  --border: rgba(255, 255, 255, 0.1);
+  --border-glow: rgba(0, 229, 255, 0.35);
+
+  --text-primary: #f5f7fa;
+  --text-secondary: #c4d1e2;
+  --text-muted: #7e8c9f;
+}
+
+/* =========================================================
+   RESET & ATMOSPHERE
+========================================================= */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  background: var(--background);
+  color: var(--text-primary);
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Atmospheric Background Gradients */
+.site {
+  position: relative;
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--text-primary);
+  background-image: 
+    radial-gradient(circle at 50% 0%, rgba(0, 229, 255, 0.08) 0%, transparent 65%),
+    radial-gradient(circle at 85% 60%, rgba(139, 92, 246, 0.05) 0%, transparent 50%),
+    radial-gradient(circle at 15% 75%, rgba(184, 255, 0, 0.04) 0%, transparent 50%);
+}
+
+::selection {
+  background: var(--accent-lime);
+  color: #05070a;
+}
+
+/* Custom Typography Utility */
+.font-display {
+  font-family: var(--font-serif);
+}
+
+/* Glassmorphism Panel Utility */
+.glass-panel {
+  background: var(--surface-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+}
+
+.glass-panel-glow {
+  background: var(--surface-glass);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-glow);
+  box-shadow: 0 12px 40px 0 rgba(0, 229, 255, 0.15);
+}
+
+/* Utility Animations */
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.9; }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 3s ease-in-out infinite;
+}
+
+/* Custom Scrollbars */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0, 229, 255, 0.3);
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 229, 255, 0.6);
+}
