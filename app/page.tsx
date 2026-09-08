@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useMemo, type PointerEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 import { ArrowDownRight, Bot, ShieldCheck, Sparkles, Terminal } from 'lucide-react'
 import Navigation from '@/components/Navigation'
 import FloatingParticles from '@/components/FloatingParticles'
@@ -13,74 +13,98 @@ import CinematicIntro from '@/components/CinematicIntro'
 import ProjectCard, { type ProjectItem } from '@/components/ProjectCard'
 import ProjectDetailModal from '@/components/ProjectDetailModal'
 import NeuralGraph from '@/components/NeuralGraph'
+import InViewMount from '@/components/InViewMount'
 import { siteConfig } from '@/data/siteConfig'
-import { useRavenStore } from '@/lib/ravenStore'
-
-type Theme = 'light' | 'dark'
+import { useRavenTheme } from '@/lib/useRavenTheme'
+import { useRavenStore, type RavenState } from '@/lib/ravenStore'
 
 export default function Page() {
-  const [theme, setTheme] = useState<Theme>('dark')
+  // The theme lives in lib/theme (localStorage + OS preference + <html data-theme>)
+  // so the CSS palette and the three.js lighting rigs read exactly one value.
+  const { theme, toggle: toggleTheme } = useRavenTheme()
   const [selectedProject, setSelectedProject] = useState<ProjectItem | null>(null)
+  // Measured by the 3D stage itself; the HUD repeats it so the claim is visible next
+  // to the bust rather than buried in devtools. It reports what the stage assembled,
+  // not a download: there is no character file to fetch any more.
+  const [ravenModel, setRavenModel] = useState<{ status: string; detail?: string }>({ status: 'loading' })
+  const handleRavenModelStatus = useCallback((status: string, detail?: string) => setRavenModel({ status, detail }), [])
   const [introFinished, setIntroFinished] = useState(false)
+  // The handoff has three moments, and the landing needs to know which one it is in:
+  // the intro is playing (landing is simply behind a veil), the intro is *exiting*
+  // (landing animates in underneath, one continuous scene), or it is over (no classes,
+  // no lingering compositor layers). See the WELCOME → LANDING HANDOFF block in globals.css.
+  const [introPhase, setIntroPhase] = useState<'playing' | 'exiting' | 'done'>('playing')
 
   const {
     state: ravenState,
     isSpeaking: speaking,
     isVisionEnabled: visionEnabled,
+    visionStatus,
+    visionMessage,
     facePresent,
     depth,
     isOnline,
+    lastMode: ravenLastMode,
     setState: setRavenState,
     toggleVision,
+    disableVision,
+    setVisionStatus,
     setFacePresent,
     setDepth,
   } = useRavenStore()
 
-  /* Load and persist theme */
-  useEffect(() => {
-    const saved = window.localStorage.getItem('riyan-theme') as Theme | null
-    if (saved === 'light' || saved === 'dark') {
-      setTheme(saved)
-    } else {
-      setTheme('dark')
-    }
-  }, [])
-
-  const toggleTheme = () => {
-    const next = theme === 'dark' ? 'light' : 'dark'
-    setTheme(next)
-    window.localStorage.setItem('riyan-theme', next)
-  }
+  /* Only ONE RavenVision instance may exist: a second getUserMedia + TFLite
+     context on the same page is what crashes the vision runtime. Vision lives
+     in the hero stage and both HUDs read its status from the store. */
+  const handleVisionStatus = useCallback(
+    (status: Parameters<typeof setVisionStatus>[0], message?: string) => setVisionStatus(status, message),
+    [setVisionStatus],
+  )
 
   const cycleRavenState = () => {
-    const states = siteConfig.ravenStates
-    const currIndex = states.indexOf(ravenState as any)
-    const nextIndex = (currIndex + 1) % states.length
-    const nextState = states[nextIndex] as any
+    const states: readonly RavenState[] = siteConfig.ravenStates
+    const currIndex = states.indexOf(ravenState)
+    const nextState = states[(currIndex + 1 + states.length) % states.length] ?? 'IDLE'
     setRavenState(nextState)
   }
 
+  const lastDepthRef = useRef({ x: 0, y: 0 })
+
   const handleStagePointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    if (visionStatus === 'LOCKED') return // camera tracking owns the gaze while locked
     const rect = e.currentTarget.getBoundingClientRect()
     if (!rect.width || !rect.height) return
 
     const strength = e.pointerType === 'touch' ? 10 : 16
-    const x = ((e.clientX - rect.left) / rect.width - 0.5) * strength
-    const y = ((e.clientY - rect.top) / rect.height - 0.5) * 12
+    const x = Number((((e.clientX - rect.left) / rect.width - 0.5) * strength).toFixed(2))
+    const y = Number((((e.clientY - rect.top) / rect.height - 0.5) * 12).toFixed(2))
 
+    if (x === lastDepthRef.current.x && y === lastDepthRef.current.y) return
+    lastDepthRef.current = { x, y }
     setDepth({ x, y })
   }
 
   const resetStageDepth = () => {
+    if (lastDepthRef.current.x === 0 && lastDepthRef.current.y === 0) return
+    lastDepthRef.current = { x: 0, y: 0 }
     setDepth({ x: 0, y: 0 })
   }
 
-  const social = useMemo(() => Object.entries(siteConfig.socialLinks), [])
+  const handleIntroComplete = useCallback(() => {
+    setIntroFinished(true)
+    setIntroPhase('done')
+  }, [])
+  const handleIntroExitStart = useCallback(() => setIntroPhase((phase) => (phase === 'playing' ? 'exiting' : phase)), [])
+
+  const social = useMemo(
+    () => Object.entries(siteConfig.socialLinks).filter(([, url]) => typeof url === 'string'),
+    [],
+  )
 
   return (
-    <div className="site" data-theme={theme}>
+    <div className="site" data-theme={theme} data-intro-phase={introFinished ? 'done' : introPhase}>
       {/* 8-Shot Cinematic Intro Sequence with Automatic Transition */}
-      {!introFinished && <CinematicIntro onComplete={() => setIntroFinished(true)} />}
+      {!introFinished && <CinematicIntro onComplete={handleIntroComplete} onExitStart={handleIntroExitStart} />}
 
       {/* Ambient Particle Web */}
       <FloatingParticles />
@@ -95,8 +119,8 @@ export default function Page() {
         <section className="max-w-7xl mx-auto px-6 py-8 sm:py-12">
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-center">
             {/* Left Column: Riyan Identity & 3D Portrait */}
-            <div className="lg:col-span-7 space-y-6">
-              <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-black/60 border border-cyan-500/20 text-xs mono text-cyan-300 backdrop-blur-md">
+            <div className="intro-reveal lg:col-span-7 space-y-6">
+              <div className="intro-reveal intro-reveal--2 inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-black/60 border border-cyan-500/20 text-xs mono text-cyan-300 backdrop-blur-md">
                 <ShieldCheck size={14} className="text-cyan-400" />
                 <span>TECHNOLOGIST · DEVELOPER · PROBLEM SOLVER · BUILDER</span>
               </div>
@@ -149,17 +173,26 @@ export default function Page() {
             {/* Right Column: RAVEN 3D Character Companion */}
             <div className="lg:col-span-5">
               <div
-                className="relative w-full h-[460px] sm:h-[520px] rounded-2xl overflow-hidden bg-[rgba(8,11,16,0.8)] border border-[rgba(0,229,255,0.20)] backdrop-blur-xl cursor-crosshair shadow-2xl"
+                className="raven-stage group relative w-full h-[460px] sm:h-[520px] rounded-2xl overflow-hidden backdrop-blur-xl cursor-crosshair shadow-2xl"
                 onPointerMove={handleStagePointerMove}
                 onPointerLeave={resetStageDepth}
                 onClick={cycleRavenState}
+                onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    cycleRavenState()
+                  }
+                }}
                 role="button"
                 tabIndex={0}
-                aria-label="RAVEN Digital Human Character Stage"
+                aria-label="RAVEN — autonomous engineering intelligence (machine bust stage)"
               >
                 <RavenHUD
                   state={ravenState}
+                  modelDetail={ravenModel.detail}
                   visionEnabled={visionEnabled}
+                  visionStatus={visionStatus}
+                  visionMessage={visionMessage}
                   facePresent={facePresent}
                   isOnline={isOnline}
                   onToggleVision={toggleVision}
@@ -170,6 +203,8 @@ export default function Page() {
                   enabled={visionEnabled}
                   onDepthChange={setDepth}
                   onPresenceChange={setFacePresent}
+                  onStatusChange={handleVisionStatus}
+                  onDisable={disableVision}
                 />
 
                 <Raven3D
@@ -177,6 +212,12 @@ export default function Page() {
                   state={ravenState}
                   speaking={speaking}
                   blinking={false}
+                  variant="hero"
+                  onStatusChange={handleRavenModelStatus}
+                  /* The bust itself is what arrives: settling the canvas inside a still
+                     frame reads as a camera move, and it keeps the animation off the
+                     blurred stage surface (animating a backdrop-filter jitters). */
+                  className="intro-reveal--raven intro-stage-anchor"
                 />
               </div>
             </div>
@@ -223,35 +264,44 @@ export default function Page() {
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
             {/* 3D Character Stage */}
             <div
-              className="lg:col-span-6 relative w-full h-[420px] rounded-2xl overflow-hidden bg-[rgba(8,11,16,0.8)] border border-[rgba(0,229,255,0.20)] backdrop-blur-xl cursor-pointer"
+              className="raven-stage group lg:col-span-6 relative w-full h-[420px] sm:h-[480px] rounded-2xl overflow-hidden backdrop-blur-xl cursor-pointer"
               onPointerMove={handleStagePointerMove}
               onPointerLeave={resetStageDepth}
               onClick={cycleRavenState}
+              onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  cycleRavenState()
+                }
+              }}
               role="button"
               tabIndex={0}
               aria-label="RAVEN Centerpiece Stage"
             >
               <RavenHUD
                 state={ravenState}
+                modelDetail={ravenModel.detail}
                 visionEnabled={visionEnabled}
+                visionStatus={visionStatus}
+                visionMessage={visionMessage}
                 facePresent={facePresent}
                 isOnline={isOnline}
                 onToggleVision={toggleVision}
                 onCycleState={cycleRavenState}
               />
 
-              <RavenVision
-                enabled={visionEnabled}
-                onDepthChange={setDepth}
-                onPresenceChange={setFacePresent}
-              />
-
-              <Raven3D
-                depth={depth}
-                state={ravenState}
-                speaking={speaking}
-                blinking={false}
-              />
+              {/* Waist-up framing here: the hero already owns the close-up. The
+                  scene is only built once this card is within 300px of the
+                  viewport, so the first paint pays for one stage, not two. */}
+              <InViewMount>
+                <Raven3D
+                  depth={depth}
+                  state={ravenState}
+                  speaking={speaking}
+                  blinking={false}
+                  variant="stage"
+                />
+              </InViewMount>
             </div>
 
             {/* Floating Glass Console */}

@@ -31,24 +31,112 @@
 
   --glow-shadow: 0 12px 40px 0 rgba(0, 229, 255, 0.12);
 
+  /* Font families are self-hosted via @fontsource-variable (see app/layout.tsx).
+     These names are what the utilities below resolve to. */
+  --font-geist: "Geist Variable", system-ui, -apple-system, sans-serif;
+  --font-geist-mono: "Geist Mono Variable", ui-monospace, monospace;
+  --font-cormorant: "Cormorant Garamond Variable", "Times New Roman", Georgia, serif;
+
   --font-sans: var(--font-geist), system-ui, -apple-system, sans-serif;
   --font-serif: var(--font-cormorant), "Times New Roman", Georgia, serif;
   --font-mono: var(--font-geist-mono), monospace;
 }
 
+/* =========================================================
+   THEMES
+   ----------------------------------------------------------
+   Two *semantic* palettes, not two colour inversions. Dark is the
+   cinematic night environment; light is a printed-matter environment
+   (warm paper, ink text, desaturated teal/olive accents that actually
+   hold contrast on paper). Every surface, border and glow is re-picked
+   for the theme rather than derived from the other one, and the WebGL
+   stages swap their whole lighting rig through the same
+   `data-theme` attribute (see lib/theme.ts).
+========================================================= */
+
+html[data-theme="light"],
 .site[data-theme="light"] {
-  --background: #080b10;
-  --surface: #0d1117;
-  --surface-elevated: #121821;
-  --surface-glass: rgba(18, 24, 33, 0.75);
+  /* Paper & ink */
+  --background: #f2efe7;
+  --surface: #faf8f3;
+  --surface-elevated: #ffffff;
+  --surface-glass: rgba(255, 253, 248, 0.78);
 
-  --border: rgba(255, 255, 255, 0.1);
-  --border-glow: rgba(0, 229, 255, 0.35);
+  --border: rgba(18, 24, 32, 0.12);
+  --border-glow: rgba(14, 116, 144, 0.34);
 
-  --text-primary: #f5f7fa;
-  --text-secondary: #c4d1e2;
-  --text-muted: #7e8c9f;
+  --text-primary: #101820;
+  --text-secondary: #3a4756;
+  --text-muted: #6d7b8b;
+
+  /* Accents are re-tuned for paper: the neon versions are unreadable on cream. */
+  --accent-cyan: #0e7490;
+  --accent-cyan-soft: rgba(14, 116, 144, 0.1);
+  --accent-lime: #4d7c0f;
+  --accent-lime-soft: rgba(77, 124, 15, 0.1);
+  --accent-violet: #6d28d9;
+  --accent-violet-soft: rgba(109, 40, 217, 0.08);
+
+  --glow-shadow: 0 12px 40px 0 rgba(14, 116, 144, 0.14);
+  --shadow-panel: 0 10px 30px -12px rgba(16, 24, 32, 0.25);
+
+  /* Stage dressing */
+  --stage-veil: linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(242, 239, 231, 0.2));
+  --stage-scrim: rgba(255, 255, 255, 0.62);
 }
+
+html[data-theme="dark"] {
+  --shadow-panel: 0 10px 30px -12px rgba(0, 0, 0, 0.6);
+  --stage-veil: linear-gradient(180deg, rgba(8, 11, 16, 0.35), rgba(5, 7, 10, 0.75));
+  --stage-scrim: rgba(5, 7, 10, 0.62);
+}
+
+html[data-theme="light"] body,
+html[data-theme="light"] .site {
+  background-image:
+    radial-gradient(circle at 50% 0%, rgba(14, 116, 144, 0.07) 0%, transparent 60%),
+    radial-gradient(circle at 85% 60%, rgba(109, 40, 217, 0.05) 0%, transparent 50%),
+    radial-gradient(circle at 15% 75%, rgba(77, 124, 15, 0.05) 0%, transparent 50%);
+}
+
+html[data-theme="light"] ::selection {
+  background: var(--accent-lime);
+  color: #ffffff;
+}
+
+/* ------------------------------------------------------------
+   Theme compatibility layer.
+   The UI was authored dark-first with literal Tailwind greys
+   (`text-white`, `bg-black/40`, `border-white/10`). Those are
+   not theme-aware, so in the paper theme they would be invisible
+   rather than merely different. This maps the handful of literals
+   that actually appear in the tree onto the semantic tokens above
+   instead of re-writing every call site. Specificity here beats a
+   bare utility class, so no `!important` is needed.
+------------------------------------------------------------ */
+html[data-theme="light"] .text-white { color: var(--text-primary); }
+html[data-theme="light"] .text-gray-200 { color: #2a3644; }
+html[data-theme="light"] .text-gray-300 { color: var(--text-secondary); }
+html[data-theme="light"] .text-gray-400 { color: var(--text-muted); }
+html[data-theme="light"] .text-gray-500 { color: var(--text-muted); }
+html[data-theme="light"] .text-cyan-300 { color: #0b5f76; }
+html[data-theme="light"] .text-cyan-400 { color: var(--accent-cyan); }
+html[data-theme="light"] .text-lime-400 { color: var(--accent-lime); }
+html[data-theme="light"] .text-violet-400 { color: var(--accent-violet); }
+html[data-theme="light"] .bg-black\/40 { background-color: rgba(255, 255, 255, 0.66); }
+html[data-theme="light"] .bg-black\/50 { background-color: rgba(255, 255, 255, 0.7); }
+html[data-theme="light"] .bg-black\/60 { background-color: rgba(255, 255, 255, 0.74); }
+html[data-theme="light"] .bg-black\/70 { background-color: rgba(255, 255, 255, 0.8); }
+html[data-theme="light"] .bg-white\/5 { background-color: rgba(16, 24, 32, 0.05); }
+html[data-theme="light"] .border-white\/5 { border-color: rgba(16, 24, 32, 0.08); }
+html[data-theme="light"] .border-white\/10 { border-color: rgba(16, 24, 32, 0.14); }
+html[data-theme="light"] .border-cyan-500\/30 { border-color: rgba(14, 116, 144, 0.4); }
+html[data-theme="light"] .from-white\/10 { --tw-gradient-from: rgba(16, 24, 32, 0.07); }
+html[data-theme="light"] .to-transparent { --tw-gradient-to: transparent; }
+html[data-theme="light"] .shadow-2xl { box-shadow: var(--shadow-panel); }
+html[data-theme="light"] .backdrop-blur-xl { backdrop-filter: blur(14px) saturate(1.05); }
+html[data-theme="light"] .hover\:bg-cyan-400:hover { background-color: #0b5f76; }
+html[data-theme="light"] .text-black { color: #ffffff; }
 
 /* =========================================================
    RESET & ATMOSPHERE
@@ -137,4 +225,458 @@ body {
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: rgba(0, 229, 255, 0.6);
+}
+
+/* =========================================================
+   RAVEN STAGE SURFACES
+   Classes referenced by components/Raven3D and components/RavenVision
+   that had no stylesheet backing (the vision readout rendered unstyled,
+   in normal flow, on top of the canvas).
+========================================================= */
+
+.raven-3d-container canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Camera tracking readout — positioned, never overlapping the character */
+.raven-vision-indicator {
+  position: absolute;
+  left: 1rem;
+  bottom: 3.25rem;
+  z-index: 30;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: calc(100% - 2rem);
+  padding: 0.3rem 0.6rem;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(245, 247, 250, 0.72);
+  pointer-events: none;
+}
+
+.raven-vision-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: #4b5563;
+  flex: none;
+}
+
+.vision-offline .raven-vision-dot { background: #4b5563; }
+.vision-starting .raven-vision-dot,
+.vision-searching .raven-vision-dot,
+.vision-recovering .raven-vision-dot {
+  background: #38bdf8;
+  animation: ravenVisionPulse 1.2s ease-in-out infinite;
+}
+.vision-locked .raven-vision-dot { background: #b8ff00; box-shadow: 0 0 10px #b8ff00; }
+.vision-locked { border-color: rgba(184, 255, 0, 0.35); color: #d9ff8f; }
+.vision-unavailable .raven-vision-dot,
+.vision-unsupported .raven-vision-dot { background: #f59e0b; }
+.vision-unavailable,
+.vision-unsupported { border-color: rgba(245, 158, 11, 0.35); color: #fcd48a; }
+
+.raven-vision-error {
+  flex-basis: 100%;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+@keyframes ravenVisionPulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+/* Honest model-state surface — shown when the RAVEN GLB is absent */
+.raven-model-state {
+  position: absolute;
+  inset: auto 1rem 30% 1rem;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.9rem 1rem;
+  text-align: center;
+  border-radius: 0.75rem;
+  border: 1px dashed rgba(245, 158, 11, 0.45);
+  background: rgba(5, 7, 10, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  font-family: var(--font-mono);
+  pointer-events: none;
+}
+
+.raven-model-state__title {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #fcd48a;
+}
+
+.raven-model-state__detail {
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: rgba(196, 209, 226, 0.75);
+  max-width: 34ch;
+  overflow-wrap: anywhere;
+}
+
+.raven-model-state--loading {
+  border-style: solid;
+  border-color: rgba(0, 229, 255, 0.25);
+}
+.raven-model-state--loading .raven-model-state__title { color: #7ee7f5; }
+
+.raven-model-state--error .raven-model-state__title,
+.raven-model-state--no-webgl .raven-model-state__title { color: #fca5a5; }
+.raven-model-state--error,
+.raven-model-state--no-webgl { border-color: rgba(248, 113, 113, 0.4); }
+
+.raven-model-state--warning {
+  inset: auto 1rem 1rem 1rem;
+  border-color: rgba(184, 255, 0, 0.35);
+}
+.raven-model-state--warning .raven-model-state__title { color: #d9ff8f; }
+
+@media (prefers-reduced-motion: reduce) {
+  .raven-vision-dot { animation: none !important; }
+}
+
+/* =========================================================
+   3D STAGE DRESSING (RAVEN + Riyan portrait)
+   ----------------------------------------------------------
+   Everything here is lighting-adjacent framing for the WebGL
+   canvases: a seat gradient so the character is not floating in
+   a void, a status pill that states measured facts, and the
+   portrait's glass/vignette treatment. All of it is themed with
+   the same tokens as the rest of the page.
+========================================================= */
+
+/* The frame both RAVEN stages sit in. Theme-aware on purpose: a hard-coded
+   rgba(8,11,16,.8) would leave a black slab floating on paper. */
+.raven-stage {
+  background: rgba(8, 11, 16, 0.8);
+  border: 1px solid rgba(0, 229, 255, 0.2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), var(--glow-shadow);
+}
+
+html[data-theme='light'] .raven-stage {
+  background: rgba(255, 255, 255, 0.66);
+  border: 1px solid rgba(14, 116, 144, 0.28);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), var(--shadow-panel);
+}
+
+.raven-3d-container {
+  isolation: isolate;
+  background:
+    radial-gradient(ellipse 62% 46% at 50% 74%, var(--accent-cyan-soft), transparent 70%),
+    radial-gradient(ellipse 46% 40% at 50% 18%, var(--accent-violet-soft), transparent 72%);
+}
+
+/* Soft floor pool so the bust reads as standing in a room, not pasted on. */
+.raven-3d-container::after {
+  content: '';
+  position: absolute;
+  inset: auto 8% 6% 8%;
+  height: 16%;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(0, 229, 255, 0.14), transparent 68%);
+  filter: blur(10px);
+  pointer-events: none;
+  z-index: -1;
+}
+
+html[data-theme='light'] .raven-3d-container::after {
+  background: radial-gradient(ellipse at center, rgba(14, 116, 144, 0.12), transparent 68%);
+}
+
+/* There is deliberately no progress bar here any more. The bust is assembled in code in
+   a few milliseconds — there is no download with a percentage to report, and drawing a
+   determinate bar for an indeterminate thing is the kind of decoration this project
+   refuses. */
+
+/* The "what is real / what is simulated" pill. Quiet by default so it never competes
+   with the bust, fully visible on hover or focus. */
+.raven-model-state--info {
+  inset: auto 1rem 1rem 1rem;
+  justify-content: flex-start;
+  align-items: flex-start;
+  text-align: left;
+  gap: 0.3rem;
+  padding: 0.5rem 0.7rem;
+  opacity: 0.45;
+  border-color: var(--border-glow);
+  transition: opacity 200ms ease-out;
+}
+
+.raven-3d-container:hover .raven-model-state--info,
+.raven-3d-container:focus-within .raven-model-state--info {
+  opacity: 1;
+}
+
+.raven-model-state--info .raven-model-state__title {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.raven-model-state--info .raven-model-state__detail {
+  color: rgba(196, 209, 226, 0.6);
+  max-width: 46ch;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+html[data-theme='light'] .raven-model-state {
+  background: rgba(255, 253, 248, 0.86);
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+
+html[data-theme='light'] .raven-model-state__detail {
+  color: rgba(58, 71, 86, 0.85);
+}
+
+html[data-theme='light'] .raven-model-state--info .raven-model-state__detail {
+  color: var(--text-muted);
+}
+
+
+/* ---- Riyan portrait ---- */
+.portrait-frame {
+  background:
+    radial-gradient(ellipse 70% 55% at 50% 100%, var(--accent-violet-soft), transparent 70%),
+    linear-gradient(180deg, rgba(10, 14, 20, 0.55), rgba(10, 14, 20, 0.1));
+}
+
+html[data-theme='light'] .portrait-frame {
+  background:
+    radial-gradient(ellipse 70% 55% at 50% 100%, var(--accent-cyan-soft), transparent 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0.06));
+}
+
+.portrait-vignette {
+  background: linear-gradient(180deg, rgba(5, 7, 10, 0) 46%, rgba(5, 7, 10, 0.72) 100%);
+  mix-blend-mode: multiply;
+}
+
+html[data-theme='light'] .portrait-vignette {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 52%, rgba(242, 239, 231, 0.66) 100%);
+  mix-blend-mode: normal;
+}
+
+/* Specular sweep across the glass face of the frame. */
+.portrait-sheen {
+  background: linear-gradient(
+    108deg,
+    transparent 32%,
+    rgba(190, 235, 255, 0.1) 45%,
+    rgba(255, 255, 255, 0.2) 50%,
+    rgba(190, 235, 255, 0.1) 55%,
+    transparent 68%
+  );
+  transform: translateX(-42%);
+  opacity: 0;
+  transition: opacity 320ms ease-out;
+}
+
+.group:hover .portrait-sheen {
+  opacity: 1;
+  animation: portrait-sheen 2.6s cubic-bezier(0.3, 0.7, 0.2, 1) infinite;
+}
+
+@keyframes portrait-sheen {
+  0% { transform: translateX(-46%); }
+  100% { transform: translateX(46%); }
+}
+
+.portrait-badge {
+  background: rgba(5, 7, 10, 0.72);
+}
+
+html[data-theme='light'] .portrait-badge {
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 6px 18px -12px rgba(16, 24, 32, 0.5);
+}
+
+.portrait-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent-lime);
+  box-shadow: 0 0 10px 0 var(--accent-lime);
+  animation: pulseGlow 3s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .group:hover .portrait-sheen { animation: none; opacity: 0.6; }
+  .portrait-dot { animation: none; }
+  .raven-model-state { transition: none; }
+}
+
+/* ---- surfaces that were authored with literal night colours ---- */
+.nav-surface {
+  background: rgba(5, 7, 10, 0.85);
+}
+.nav-surface--solid {
+  background: rgba(5, 7, 10, 0.97);
+}
+html[data-theme='light'] .nav-surface {
+  background: rgba(252, 250, 246, 0.86);
+}
+html[data-theme='light'] .nav-surface--solid {
+  background: rgba(252, 250, 246, 0.97);
+}
+
+.raven-console-panel {
+  background: rgba(8, 11, 16, 0.82);
+}
+html[data-theme='light'] .raven-console-panel {
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: var(--shadow-panel);
+}
+
+/* ==================================================================
+   WELCOME → LANDING HANDOFF
+
+   The intro used to end as one flat 700 ms dissolve of an opaque
+   full-screen panel, then the panel was removed from the DOM at the
+   exact instant the fade finished — which is what read as "page A
+   disappears, page B appears". It is now a staged handoff where the two
+   layers separate in time, so it reads as one camera move into the lab:
+
+     0.0s  the intro's *content* (canvas + type) lifts away first
+     0.3s  the background veil starts falling, and the veil itself dollies
+     0.26s the landing hero rises in behind it (never a swap, an arrival)
+     0.34s the RAVEN stage settles from 1.045 into its final framing
+     1.2s  the overlay is unmounted, long after anything is visible
+
+   Deliberately: transform + opacity only, so nothing re-lays-out; no blur
+   or filter animation, because this runs on top of two live WebGL canvases;
+   the landing reveal is a keyframe *animation* rather than a transition, so
+   the hero is fully visible while the intro plays (no hidden-until-hydration
+   flash, and with JS off it simply never animates). The landing DOM, the
+   hero canvas and the portrait canvas are never remounted by any of this.
+   ================================================================== */
+.intro-veil {
+  transition:
+    opacity 620ms cubic-bezier(0.33, 0, 0.2, 1) 300ms,
+    transform 900ms cubic-bezier(0.16, 0.7, 0.24, 1) 300ms;
+}
+
+.intro-veil--exiting {
+  opacity: 0;
+  transform: scale(1.045);
+}
+
+.intro-veil__content {
+  transition:
+    opacity 460ms cubic-bezier(0.4, 0, 1, 1),
+    transform 520ms cubic-bezier(0.4, 0, 1, 1);
+}
+
+.intro-veil--exiting .intro-veil__content {
+  opacity: 0;
+  transform: translate3d(0, -16px, 0) scale(1.012);
+}
+
+/* The one trick that turns a fade into a camera move: a light sweep across
+   the veil as it lifts, so the eye reads travel instead of a dissolve. */
+.intro-veil::after {
+  content: '';
+  position: absolute;
+  inset: -25% -70%;
+  opacity: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    transparent 32%,
+    rgba(0, 229, 255, 0.05) 45%,
+    rgba(245, 247, 250, 0.09) 50%,
+    rgba(139, 92, 246, 0.05) 55%,
+    transparent 68%
+  );
+  transform: translate3d(-38%, 0, 0);
+}
+
+.intro-veil--exiting::after {
+  animation: introSweep 940ms cubic-bezier(0.24, 0.5, 0.2, 1) 120ms both;
+}
+
+@keyframes introSweep {
+  from {
+    opacity: 0.9;
+    transform: translate3d(-38%, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(38%, 0, 0);
+  }
+}
+
+/* Landing entrance. Scoped to the phase attribute the page sets, so the
+   same markup is untouched the moment the handoff is over. */
+@keyframes introRise {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes introSettle {
+  from {
+    opacity: 0.65;
+    transform: scale(1.045) translate3d(0, 10px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+[data-intro-phase='exiting'] .intro-reveal {
+  animation: introRise 720ms cubic-bezier(0.22, 0.61, 0.3, 1) 260ms both;
+}
+
+[data-intro-phase='exiting'] .intro-reveal--2 {
+  animation-delay: 360ms;
+}
+
+[data-intro-phase='exiting'] .intro-reveal--raven {
+  animation: introSettle 860ms cubic-bezier(0.18, 0.62, 0.24, 1) 340ms both;
+}
+
+/* And once it is over, the stage must not keep a compositor layer alive for
+   a transform that has already reached its final value. */
+.intro-stage-anchor {
+  transform-origin: 50% 42%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .intro-veil,
+  .intro-veil__content {
+    transition: none;
+  }
+  .intro-veil--exiting::after,
+  [data-intro-phase='exiting'] .intro-reveal,
+  [data-intro-phase='exiting'] .intro-reveal--raven {
+    animation: none;
+  }
 }

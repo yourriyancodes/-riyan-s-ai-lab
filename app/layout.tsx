@@ -1,10 +1,14 @@
 import { Analytics } from '@vercel/analytics/next'
-import { Cormorant_Garamond, Geist, Geist_Mono } from 'next/font/google'
 import type { Metadata, Viewport } from 'next'
 
-const geist = Geist({ subsets: ['latin'], variable: '--font-geist' })
-const geistMono = Geist_Mono({ subsets: ['latin'], variable: '--font-geist-mono' })
-const cormorant = Cormorant_Garamond({ subsets: ['latin'], variable: '--font-cormorant' })
+// Self-hosted open-source fonts (SIL OFL 1.1, $0). next/font/google downloads
+// at build time, which makes the build fail on any machine without egress to
+// fonts.googleapis.com. These resolve from node_modules instead.
+import { themeInitScript } from '@/lib/theme'
+
+import '@fontsource-variable/geist'
+import '@fontsource-variable/geist-mono'
+import '@fontsource-variable/cormorant-garamond'
 import './globals.css'
 
 export const metadata: Metadata = {
@@ -43,7 +47,13 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en" className={`${geist.variable} ${geistMono.variable} ${cormorant.variable}`}>
+    <html lang="en" data-theme="dark" style={{ colorScheme: 'dark' }}>
+      <head>
+        {/* Applies the saved (or OS) theme before first paint: a light-theme
+            visitor must never see a dark flash, and the WebGL stages read the
+            same attribute, so 2D and 3D can never disagree on load. */}
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
       <body className="antialiased">
         {children}
         {process.env.NODE_ENV === 'production' && <Analytics />}

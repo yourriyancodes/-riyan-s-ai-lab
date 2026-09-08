@@ -5,10 +5,26 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "check:assets": "node scripts/check-assets.mjs",
+    "gen:portrait": "node scripts/generate-portrait-depth.mjs",
+    "typecheck": "tsc --noEmit",
+    "check:speech": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/check-speech-sync.mjs",
+    "check:voice": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/check-voice.mjs",
+    "check:framing": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/check-portrait-framing.mjs",
+    "check:machine": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/lib/tsr.mjs scripts/check-machine-render.mjs",
+    "check": "npm run typecheck && npm run schema:check && npm run check:assets && npm run check:speech && npm run check:voice && npm run check:framing && npm run check:machine && npm run check:brain && npm run check:backend",
+    "preview:machine": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/lib/tsr.mjs scripts/render-machine-preview.mjs",
+    "check:brain": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/lib/tsr.mjs scripts/check-brain.mjs",
+    "check:backend": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/lib/tsr.mjs scripts/check-backend.mjs",
+    "schema": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/lib/tsr.mjs scripts/sync-schema.mjs",
+    "schema:check": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/lib/tsr.mjs scripts/sync-schema.mjs --verify"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
+    "@fontsource-variable/cormorant-garamond": "^5.3.0",
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
     "@mediapipe/tasks-vision": "^1.0.1",
     "@react-three/drei": "^10.7.8",
     "@react-three/fiber": "^9.7.0",

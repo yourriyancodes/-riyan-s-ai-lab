@@ -30,7 +30,7 @@ export default function Navigation({ theme, onToggleTheme }: NavigationProps) {
   ]
 
   return (
-    <header className={`fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${scrolled ? 'bg-[#05070a]/85 backdrop-blur-md border-b border-white/10 py-3 shadow-2xl' : 'bg-transparent py-5'}`}>
+    <header className={`fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${scrolled ? 'nav-surface backdrop-blur-md border-b border-white/10 py-3 shadow-2xl' : 'bg-transparent py-5'}`}>
       <div className="max-w-7xl mx-auto px-6 flex items-center justify-between">
         {/* Brand */}
         <a href="#top" className="flex items-center gap-3 group" onClick={() => setIsOpen(false)}>
@@ -83,7 +83,7 @@ export default function Navigation({ theme, onToggleTheme }: NavigationProps) {
 
       {/* Mobile Menu Drawer */}
       {isOpen && (
-        <div className="md:hidden bg-[#05070a]/95 backdrop-blur-xl border-b border-cyan-500/20 p-6 space-y-4">
+        <div className="md:hidden nav-surface nav-surface--solid backdrop-blur-xl border-b border-cyan-500/20 p-6 space-y-4">
           <nav className="flex flex-col space-y-3 font-mono text-sm">
             {navItems.map((item, index) => (
               <a

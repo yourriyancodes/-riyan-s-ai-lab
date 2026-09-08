@@ -3,12 +3,39 @@
 import { useState, useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import { ArrowRight, Volume2, VolumeX } from 'lucide-react'
+import { buildRavenMachine, disposeRavenMachine, driveRavenMachine, machineBounds, type RavenMachine } from '@/lib/ravenMachine'
+import { ravenSpeechAvailable, speakRaven, stopRavenSpeech } from '@/lib/ravenVoice'
 
 type CinematicIntroProps = {
   onComplete: () => void
+  /**
+   * Fires the instant the exit choreography starts, one beat before
+   * `onComplete` (which only runs once nothing is left to see). The page uses it to
+   * begin revealing the landing *underneath*, which is what makes this one continuous
+   * scene rather than two page states.
+   */
+  onExitStart?: () => void
 }
 
-export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
+export default function CinematicIntro({ onComplete, onExitStart }: CinematicIntroProps) {
+  const onCompleteRef = useRef(onComplete)
+  const onExitStartRef = useRef(onExitStart)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete
+  }, [onComplete])
+
+  useEffect(() => {
+    onExitStartRef.current = onExitStart
+  }, [onExitStart])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
   const mountRef = useRef<HTMLDivElement | null>(null)
   const [sceneStage, setSceneStage] = useState<number>(0)
   const [typedTextStage, setTypedTextStage] = useState<number>(0)
@@ -18,12 +45,22 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
   useEffect(() => {
     // Check URL params for replay override: ?intro=1 or ?replay=1
     if (typeof window !== 'undefined') {
+      if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+        // The cinematic is motion by definition; honour the setting and go straight in.
+        onCompleteRef.current()
+        return
+      }
       const params = new URLSearchParams(window.location.search)
       const forceReplay = params.get('intro') === '1' || params.get('replay') === '1'
-      const hasSeen = localStorage.getItem('riyan_intro_seen')
+      let hasSeen: string | null = null
+      try {
+        hasSeen = localStorage.getItem('riyan_intro_seen')
+      } catch {
+        hasSeen = null
+      }
 
       if (!forceReplay && hasSeen === 'true') {
-        onComplete()
+        onCompleteRef.current()
         return
       }
     }
@@ -57,28 +94,31 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
     ]
 
     return () => timers.forEach(clearTimeout)
-  }, [onComplete])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Speech Synthesis Greeting Trigger during SHOT 06
+  /**
+   * The greeting is RAVEN speaking, so it goes through RAVEN's one voice controller —
+   * same resolved voice, same prosody, same cancel-before-speak. This effect used to build
+   * its own `SpeechSynthesisUtterance` with its own three-name voice guess and its own
+   * rate and pitch, which is the second half of the "sometimes male, sometimes female"
+   * report: the welcome line and the answers were literally programmed to pick different
+   * voices, and both fell back to the browser default when Chrome had not populated
+   * `getVoices()` yet. `spokenForRef` keeps Strict Mode's double effect run from queueing
+   * the line twice, while still letting a deliberate mute/unmute re-greet.
+   */
+  const spokenForRef = useRef<boolean | null>(null)
   useEffect(() => {
-    if (typedTextStage === 1 && audioEnabled && typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel()
-      const utterance = new SpeechSynthesisUtterance("Hello. I am RAVEN, Riyan Pasha's AI companion.")
-      utterance.rate = 0.95
-      utterance.pitch = 1.05
-      const voices = window.speechSynthesis.getVoices()
-      const femaleVoice = voices.find(
-        (v) =>
-          v.lang.startsWith('en') &&
-          (v.name.includes('Female') || v.name.includes('Samantha') || v.name.includes('Zira'))
-      )
-      if (femaleVoice) utterance.voice = femaleVoice
-      try {
-        window.speechSynthesis.speak(utterance)
-      } catch {
-        // Fallback
-      }
-    }
+    const activated = typeof navigator !== 'undefined' ? (navigator as Navigator & { userActivation?: { hasBeenActive?: boolean } }).userActivation?.hasBeenActive : undefined
+    // Skip the spoken greeting until the visitor has interacted, otherwise the
+    // browser rejects the utterance and logs an autoplay error.
+    if (activated === false) return
+    if (typedTextStage !== 1 || !ravenSpeechAvailable()) return
+    if (spokenForRef.current === audioEnabled) return
+    spokenForRef.current = audioEnabled
+    if (!audioEnabled) return
+    void speakRaven("Hello. I am RAVEN, Riyan Pasha's AI companion.")
   }, [typedTextStage, audioEnabled])
 
   // 3D Three.js Cinematic Scene
@@ -137,44 +177,126 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
     const pCloud = new THREE.Points(pGeo, pMat)
     scene.add(pCloud)
 
-    // RAVEN SILHOUETTE HEAD BUST
-    const headGroup = new THREE.Group()
-    scene.add(headGroup)
+    // RAVEN SILHOUETTE — the same procedural bust the console renders, at the lowest
+    // quality tier and re-lit so that only its contour reads. Deliberately not a
+    // primitive head and not a photo of a person: if the bust cannot be assembled, this
+    // sequence stays light and particles and says nothing false.
+    const silhouette = new THREE.Group()
+    scene.add(silhouette)
 
-    const skinMat = new THREE.MeshStandardMaterial({
-      color: 0x080b10,
-      roughness: 0.25,
-      metalness: 0.9,
+    const silhouetteMaterials: THREE.MeshStandardMaterial[] = []
+    let machine: RavenMachine | null = null
+    const glowTexture = (() => {
+      const size = 64
+      const canvas = document.createElement('canvas')
+      canvas.width = size
+      canvas.height = size
+      const context = canvas.getContext('2d')
+      if (context) {
+        const gradient = context.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2)
+        gradient.addColorStop(0, 'rgba(210,250,255,1)')
+        gradient.addColorStop(0.35, 'rgba(0,229,255,0.55)')
+        gradient.addColorStop(1, 'rgba(0,229,255,0)')
+        context.fillStyle = gradient
+        context.fillRect(0, 0, size, size)
+      }
+      const texture = new THREE.CanvasTexture(canvas)
+      texture.colorSpace = THREE.SRGBColorSpace
+      return texture
+    })()
+
+    const glowSpriteMaterial = new THREE.SpriteMaterial({
+      map: glowTexture,
       transparent: true,
       opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
     })
+    const leftEyeGlow = new THREE.Sprite(glowSpriteMaterial)
+    const rightEyeGlow = new THREE.Sprite(glowSpriteMaterial.clone())
+    leftEyeGlow.scale.setScalar(0.1)
+    rightEyeGlow.scale.setScalar(0.1)
+    silhouette.add(leftEyeGlow, rightEyeGlow)
 
-    const headGeo = new THREE.SphereGeometry(0.85, 36, 36)
-    const headPos = headGeo.attributes.position as THREE.BufferAttribute
-    for (let i = 0; i < headPos.count; i++) {
-      let x = headPos.getX(i)
-      let y = headPos.getY(i)
-      let z = headPos.getZ(i)
-      if (y < 0) {
-        const f = Math.abs(y)
-        x *= Math.max(0.42, 1 - f * 0.45)
-        z *= Math.max(0.52, 1 - f * 0.32)
+    try {
+      machine = buildRavenMachine('low')
+      silhouette.add(machine.root)
+      machine.root.traverse((child) => {
+        const mesh = child as THREE.Mesh
+        if (!mesh.isMesh) return
+        mesh.frustumCulled = false
+        // The instanced glow families are unlit by construction (they are emission, not
+        // surface), which is exactly wrong for a silhouette: drop them and let the two
+        // sprites carry the eyes instead.
+        const materials = (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) as THREE.Material[]
+        if (materials.some((material) => (material as THREE.MeshBasicMaterial).isMeshBasicMaterial)) mesh.visible = false
+      })
+      for (const group of Object.values(machine.groups)) group.mesh.visible = false
+
+      // One dark, semi-transparent surface for the whole bust: the intro needs a
+      // contour, not the material study. Mutated in place because these materials are
+      // already per-build (this is a private `low` assembly), so there is nothing to
+      // share with the hero stage and nothing extra to dispose.
+      const unique = new Set<THREE.MeshStandardMaterial>()
+      machine.root.traverse((child) => {
+        const mesh = child as THREE.Mesh
+        if (!mesh.isMesh) return
+        for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+          if (!material || (material as THREE.MeshBasicMaterial).isMeshBasicMaterial) continue
+          unique.add(material as THREE.MeshStandardMaterial)
+        }
+      })
+      for (const material of unique) {
+        material.color.setHex(0x070a10)
+        material.roughness = 0.5
+        material.metalness = 0.2
+        material.emissive.setHex(0x081520)
+        material.emissiveIntensity = 0.4
+        material.transparent = true
+        material.opacity = 0
+        material.needsUpdate = true
+        silhouetteMaterials.push(material)
       }
-      headPos.setXYZ(i, x, y, z)
+
+      const bounds = machineBounds(machine)
+      const scale = 1.15 / Math.max(bounds.height, 1e-3)
+      silhouette.scale.setScalar(scale)
+      // The sensors sit about a quarter of the bust below the crown; centring on that
+      // rather than on the bounds keeps the head in the upper third, which is where the
+      // title needs the space.
+      const headLocalY = bounds.center.y + bounds.height * 0.244
+      silhouette.position.set(-bounds.center.x * scale, -headLocalY * scale + 0.15, 0)
+      silhouette.updateMatrixWorld(true)
+      machine.root.updateMatrixWorld(true)
+
+      // Measured, not guessed: the glow sprites are placed at the emitters' own world
+      // positions, so they stay correct if the housing is ever re-authored.
+      const seen = new Set<string>()
+      for (const [sprite, sensor] of [
+        [leftEyeGlow, machine.sensors.left],
+        [rightEyeGlow, machine.sensors.right],
+      ] as const) {
+        const point = new THREE.Vector3()
+        sensor.getWorldPosition(point)
+        silhouette.worldToLocal(point)
+        sprite.position.copy(point)
+        sprite.scale.setScalar(0.1 / Math.max(scale, 1e-3))
+        seen.add(sprite.uuid)
+      }
+      if (seen.size === 0) {
+        leftEyeGlow.visible = false
+        rightEyeGlow.visible = false
+      }
+    } catch {
+      // No bust, no silhouette: the particles and the type still carry the shot.
+      if (machine) {
+        silhouette.remove(machine.root)
+        disposeRavenMachine(machine)
+        machine = null
+      }
+      leftEyeGlow.visible = false
+      rightEyeGlow.visible = false
     }
-    headGeo.computeVertexNormals()
-
-    const headMesh = new THREE.Mesh(headGeo, skinMat)
-    headGroup.add(headMesh)
-
-    // Eyes
-    const eyeMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0 })
-    const leftEye = new THREE.Mesh(new THREE.SphereGeometry(0.06, 16, 16), eyeMat)
-    const rightEye = new THREE.Mesh(new THREE.SphereGeometry(0.06, 16, 16), eyeMat)
-    leftEye.position.set(-0.32, 0.3, 0.76)
-    rightEye.position.set(0.32, 0.3, 0.76)
-    headGroup.add(leftEye)
-    headGroup.add(rightEye)
 
     const handleResize = () => {
       if (!mount) return
@@ -184,6 +306,7 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
     }
     window.addEventListener('resize', handleResize)
 
+    let lastFrame = performance.now()
     const animate = (now: number) => {
       if (disposed) return
       animationFrameId = requestAnimationFrame(animate)
@@ -196,21 +319,51 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
       }
 
       if (elapsed >= 2.5 && elapsed < 4.5) {
-        skinMat.opacity = THREE.MathUtils.lerp(skinMat.opacity, 0.85, 0.04)
+        for (const material of silhouetteMaterials) {
+          material.opacity = THREE.MathUtils.lerp(material.opacity, 0.92, 0.04)
+        }
         violetRimLight.intensity = THREE.MathUtils.lerp(violetRimLight.intensity, 3.5, 0.04)
       }
 
       if (elapsed >= 5.2 && elapsed < 6.5) {
-        eyeMat.opacity = THREE.MathUtils.lerp(eyeMat.opacity, 1.0, 0.08)
-        headGroup.rotation.x = THREE.MathUtils.lerp(headGroup.rotation.x, -0.05, 0.04)
+        // Eyes activate and the gaze lifts off the floor.
+        const leftMaterial = leftEyeGlow.material as THREE.SpriteMaterial
+        const rightMaterial = rightEyeGlow.material as THREE.SpriteMaterial
+        leftMaterial.opacity = THREE.MathUtils.lerp(leftMaterial.opacity, 0.95, 0.08)
+        rightMaterial.opacity = THREE.MathUtils.lerp(rightMaterial.opacity, 0.95, 0.08)
+        silhouette.rotation.x = THREE.MathUtils.lerp(silhouette.rotation.x, -0.05, 0.04)
+        for (const material of silhouetteMaterials) {
+          material.emissiveIntensity = THREE.MathUtils.lerp(material.emissiveIntensity, 0.75, 0.05)
+        }
       }
 
       if (elapsed >= 6.5) {
         camera.position.z = THREE.MathUtils.lerp(camera.position.z, 4.4, 0.03)
-        headGroup.position.y = Math.sin(elapsed * 1.5) * 0.02
+        silhouette.position.y = 0.15 + Math.sin(elapsed * 1.5) * 0.02
+        // A slow turn of the head under the greeting — the bust's own drive supplies
+        // the stabilisation, this only keeps the contour from freezing.
+        silhouette.rotation.y = Math.sin(elapsed * 0.55) * 0.05
       }
 
       pCloud.rotation.y += 0.001
+      // The bust is driven, not posed: its idle is head stabilisation and the core's
+      // own pulse, so the silhouette is alive without a hand-animated loop.
+      if (machine) {
+        const dt = Math.min(Math.max((now - lastFrame) / 1000, 0), 0.05)
+        lastFrame = now
+        driveRavenMachine(machine, {
+          state: 'IDLE',
+          pointer: { x: 0, y: 0 },
+          speaking: false,
+          speechEnergy: 0,
+          speechOpenness: 0,
+          time: elapsed,
+          dt,
+          reducedMotion: false,
+          active: true,
+          externalBlink: false,
+        })
+      }
       renderer.render(scene, camera)
     }
 
@@ -222,36 +375,72 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
       window.removeEventListener('resize', handleResize)
       pGeo.dispose()
       pMat.dispose()
-      headGeo.dispose()
-      skinMat.dispose()
-      eyeMat.dispose()
+      glowTexture.dispose()
+      glowSpriteMaterial.dispose()
+      ;(rightEyeGlow.material as THREE.SpriteMaterial).dispose()
+      // The bust is this component's own private build, so its geometry, materials and
+      // textures are ours to release; the hero stage assembles a separate one.
+      if (machine) {
+        disposeRavenMachine(machine)
+        machine = null
+      }
+      silhouetteMaterials.length = 0
       renderer.dispose()
+      renderer.forceContextLoss?.()
       if (renderer.domElement.parentElement === mount) {
         mount.removeChild(renderer.domElement)
       }
     }
   }, [])
 
+  const finishTimerRef = useRef<number | null>(null)
+
+  /**
+   * The handoff. `isSkipping` puts the veil into its exiting state (CSS owns the actual
+   * choreography: content lifts at 0, veil falls from 300 ms, landing rises underneath),
+   * and `onExitStart` tells the page to start that landing half *now* — not after the
+   * fade, which is what made the old version feel like a page swap. `onComplete` is then
+   * deliberately late (1.2 s): the overlay is invisible for the last ~300 ms of it, but
+   * removing it the moment the fade ends is what produced the pop.
+   */
   const handleFinish = () => {
     if (isSkipping) return
     setIsSkipping(true)
-    localStorage.setItem('riyan_intro_seen', 'true')
-    setTimeout(() => {
-      onComplete()
-    }, 700)
+    onExitStartRef.current?.()
+    try {
+      localStorage.setItem('riyan_intro_seen', 'true')
+    } catch {
+      /* storage blocked — the intro just plays again next visit */
+    }
+    const reducedMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (finishTimerRef.current !== null) window.clearTimeout(finishTimerRef.current)
+    finishTimerRef.current = window.setTimeout(() => {
+      finishTimerRef.current = null
+      if (mountedRef.current) onCompleteRef.current()
+    }, reducedMotion ? 0 : 1200)
   }
+
+  useEffect(
+    () => () => {
+      if (finishTimerRef.current !== null) window.clearTimeout(finishTimerRef.current)
+    },
+    [],
+  )
 
   return (
     <div
-      className={`fixed inset-0 z-[999] bg-[#05070a] text-white overflow-hidden transition-opacity duration-700 ${
-        isSkipping ? 'opacity-0 pointer-events-none' : 'opacity-100'
+      className={`intro-veil fixed inset-0 z-[999] bg-[#05070a] text-white overflow-hidden ${
+        isSkipping ? 'intro-veil--exiting pointer-events-none' : ''
       }`}
     >
       {/* 3D Stage Container */}
-      <div ref={mountRef} className="absolute inset-0 pointer-events-none" />
+      <div ref={mountRef} className="intro-veil__content absolute inset-0 pointer-events-none" />
 
       {/* Foreground Cinematic Controls & Storytelling Overlay */}
-      <div className="relative z-10 w-full h-full flex flex-col justify-between p-6 sm:p-12 pointer-events-none">
+      <div className="intro-veil__content relative z-10 w-full h-full flex flex-col justify-between p-6 sm:p-12 pointer-events-none">
         {/* Header Controls */}
         <div className="flex items-center justify-between pointer-events-auto">
           <div className="flex items-center gap-2 mono text-xs text-cyan-400/80">
@@ -261,7 +450,11 @@ export default function CinematicIntro({ onComplete }: CinematicIntroProps) {
 
           <div className="flex items-center gap-4">
             <button
-              onClick={() => setAudioEnabled(!audioEnabled)}
+              onClick={() => {
+                // Muting must actually mute the sentence in progress, not just the next one.
+                if (audioEnabled) stopRavenSpeech()
+                setAudioEnabled(!audioEnabled)
+              }}
               className="p-2 rounded-lg border border-white/10 bg-black/40 text-gray-400 hover:text-white text-xs mono flex items-center gap-1.5 transition-all"
             >
               {audioEnabled ? <Volume2 size={14} /> : <VolumeX size={14} />}

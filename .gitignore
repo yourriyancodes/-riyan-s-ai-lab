@@ -15,3 +15,9 @@ node_modules
 .DS_Storetsconfig.tsbuildinfo
 
 tsconfig.tsbuildinfo
+
+# Generated visual-evidence renders from `npm run preview:face` (not app assets)
+.preview/
+
+# RAVEN brain dev fallback store (JSON persistence when no DATABASE_URL)
+.raven-data/

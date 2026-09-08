@@ -29,5 +29,10 @@
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "//exclude": "The Vite application in src/ plus its config are orphaned (their dependencies are not declared in package.json). They stay on disk untouched, but are excluded so `next build` type-checks the ACTIVE App Router app instead of failing on dead code. Re-include them if the Vite app is ever revived.",
+  "exclude": [
+    "node_modules",
+    "src",
+    "vite.config.ts"
+  ]
 }
