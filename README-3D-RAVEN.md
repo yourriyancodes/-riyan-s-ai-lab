@@ -231,8 +231,8 @@ string falls back to IDLE's look rather than guessing.
 | `UNDERSTANDING` | cyan 0.68 | accelerate 0.40 | 0.62 @ 0.72 | parsing |
 | `THINKING` | cyan 0.92 | accelerate 0.86 | 0.72 @ 0.95 | faster scan sweep, brightest optical activity outside EXECUTING |
 | `RESEARCHING` | cyan 0.74 | accelerate 0.60 | 0.8 @ 1.25 | retrieval running |
-| `REASONING` | **violet** 0.86 | layered 1.05 Hz | 0.8 @ 1.6 | two counter-rotating gimbal rings visible |
-| `PLANNING` | violet 0.78, shuttered 0.12 | layered 1.28 | 0.74 @ 1.9 | deliberating, apertures narrowing |
+| `REASONING` | **violet** 0.96, white-hot filament | layered 1.05 Hz | 0.8 @ 1.6 | two counter-rotating gimbal rings visible; violet costs luma (Rec.709 weights blue at 0.072), so the violet states are driven harder than the cyan ones and the filament stays white |
+| `PLANNING` | violet 0.88, shuttered 0.12 | layered 1.28 | 0.74 @ 1.9 | deliberating, apertures narrowing |
 | `EXECUTING` | cyan 1.00, wide 0.88 | **drive** 2.1 Hz | 1.0 @ 3.4 | brightest flow, tools running |
 | `VERIFYING` | **white** 0.90, aperture 0.94 | focus 0.5 | 0.5 @ 0.25 | held, scan off — checking, not searching |
 | `SPEAKING` | cyan 0.88 | drive 0.9 | 0.8 @ 1.1 | jaw follows measured speech energy |

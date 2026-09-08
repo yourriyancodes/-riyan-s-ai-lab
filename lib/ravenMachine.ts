@@ -2373,7 +2373,16 @@ export function driveRavenMachine(machine: RavenMachine, input: MachineDriveInpu
   // every state, including the dim ones — that contrast is what makes it look like it
   // is looking at something rather than being switched on.
   const filament = machine.materials.emissive.eyeCore
-  filament.emissive.setHex(look.eye.color === MACHINE_COLORS.white ? MACHINE_COLORS.white : look.eye.color)
+  // The filament stays cool-white whenever the slot has gone violet. This is not taste, it is
+  // photometry: Rec.709 weights blue at 0.0722, so a violet emitter of identical radiance
+  // measures roughly a third of the luma of a cyan one and the eyes of REASONING — the
+  // *brightest* optical state in the table — were reading as the dimmest. A white-hot core
+  // inside a violet field is also simply what an energy source looks like.
+  filament.emissive.setHex(
+    look.eye.color === MACHINE_COLORS.violet || look.eye.color === MACHINE_COLORS.white
+      ? MACHINE_COLORS.white
+      : look.eye.color,
+  )
   filament.emissiveIntensity = clamp(drive.eyeIntensity * 1.12 + 0.06, 0, EMISSIVE.eyeCore.max)
   machine.materials.emissive.channel.emissive.setHex(look.channel.color)
   machine.materials.emissive.channel.emissiveIntensity = clamp(look.channel.intensity * 0.55, 0, EMISSIVE.channel.max)

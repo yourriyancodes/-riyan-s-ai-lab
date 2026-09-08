@@ -488,7 +488,11 @@ export const STATE_LOOK: Record<string, StateLook> = {
     core: { color: C.cyan, intensity: 0.72, rate: 0.86, mode: 'accelerate' },
     channel: { color: C.violet, intensity: 0.72, speed: 0.95, mode: 'deliberate' },
     vent: { color: C.cyan, intensity: 0.4 },
-    trim: { color: C.violet, intensity: 0.5 },
+    // Seam light, capped on purpose: these are the two skull seams, and at hero scale a
+    // brighter seam reads as a violet decal on the head — a glowing line, which is exactly
+    // the cliché this rig is not allowed to have. It warms to suggest energy crossing the
+    // skull; it must never compete with the optical band for the eye's first glance.
+    trim: { color: C.violet, intensity: 0.34 },
     posture: { lean: 0.008, lift: 0.001, spread: 0.004, hold: 0.5 },
     micro: 0.42,
     track: 0.34,
@@ -509,11 +513,11 @@ export const STATE_LOOK: Record<string, StateLook> = {
     label: 'retrieval: fast low-channel traffic, eyes at partial aperture',
   },
   REASONING: {
-    eye: { color: C.violet, intensity: 0.86, aperture: 0.68, slit: 0.06, scan: 0.5 },
+    eye: { color: C.violet, intensity: 0.96, aperture: 0.68, slit: 0.06, scan: 0.5 },
     core: { color: C.violet, intensity: 0.7, rate: 1.05, mode: 'layered' },
     channel: { color: C.violet, intensity: 0.8, speed: 1.6, mode: 'deliberate' },
     vent: { color: C.violetDeep, intensity: 0.55 },
-    trim: { color: C.violet, intensity: 0.75 },
+    trim: { color: C.violet, intensity: 0.5 },
     posture: { lean: 0, lift: 0.0014, spread: 0.008, hold: 0.4 },
     micro: 0.6,
     track: 0.3,
@@ -521,11 +525,11 @@ export const STATE_LOOK: Record<string, StateLook> = {
     label: 'controlled violet/cyan activity, layered core pulse, energy crossing the skull',
   },
   PLANNING: {
-    eye: { color: C.violet, intensity: 0.78, aperture: 0.6, slit: 0.12, scan: 0.28 },
+    eye: { color: C.violet, intensity: 0.88, aperture: 0.6, slit: 0.12, scan: 0.28 },
     core: { color: C.violet, intensity: 0.86, rate: 1.28, mode: 'layered' },
     channel: { color: C.violet, intensity: 0.74, speed: 1.9, mode: 'deliberate' },
     vent: { color: C.violetDeep, intensity: 0.6 },
-    trim: { color: C.violet, intensity: 0.66 },
+    trim: { color: C.violet, intensity: 0.3 },
     posture: { lean: 0.006, lift: 0, spread: 0.012, hold: 0.3 },
     micro: 0.3,
     track: 0.25,
