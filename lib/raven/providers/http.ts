@@ -111,7 +111,11 @@ export async function requestJson(request: HttpRequest): Promise<HttpSuccess | H
       }
     }
 
-    // Network/timeout: one bounded retry, because these are the transient ones.
+    // A timeout is the endpoint saying "I am not answering in the time you gave me"; retrying it
+    // multiplies the wait without changing the odds (3 × RAVEN_TIMEOUT_MS was a 76 s turn), so this
+    // returns at once and lets the caller degrade. A connection failure is different: it is quick,
+    // usually transient, and worth one more attempt.
+    if (last?.code === 'timeout') return last
     if (attempt + 1 < attempts) {
       await sleep((request.retryBaseMs ?? 400) * 2 ** attempt)
       continue

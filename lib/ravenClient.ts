@@ -94,6 +94,8 @@ export type RavenReply = {
   reply?: string
   provider?: string
   degraded?: { from: RavenMode; because: string } | null
+  /** Hoisted copy of `metadata.trace`; the store prefers it and falls back to metadata. */
+  trace?: RavenPhase[]
   mode: RavenMode
   conversationId: string
   citations: RavenCitation[]
@@ -110,13 +112,19 @@ export type RavenHealth = {
   databaseReachable: boolean
   providerConfigured: boolean
   providerReachable: boolean
+  /**
+   * Three separate facts, not two: an endpoint can answer HTTP fine and still refuse the
+   * credential. `null` means nobody probed yet, which is why the console hides the chip
+   * rather than showing it as a failure.
+   */
+  providerAuthorized?: boolean | null
   providerAdapterImplemented: boolean
   ownerAuthConfigured: boolean
   voiceConfigured: boolean
   status: 'OFFLINE' | 'PARTIALLY_READY' | 'READY'
   note?: string
   /** Added by the brain build: the measured detail behind the summary flags. */
-  provider?: { id: string | null; label: string; model: string | null; baseUrl: string; breaker?: { open: boolean; failures: number } }
+  provider?: { id: string | null; label: string; model: string | null; baseUrl: string; breaker?: { open: boolean; failures: number }; probed?: { reachable: boolean; authorized: boolean | null; detail: string } | null }
   database?: { driver: string; detail: string; degradedFrom?: string[] }
   knowledge?: { documents: number; projects: number; skillNodes: number; glossaryEntries: number }
   tools?: { name: string; permission: string; requiresApproval: boolean }[]
@@ -255,6 +263,8 @@ export async function askRaven(input: string, options: AskOptions = {}): Promise
     ...(typeof data.provider === 'string' ? { provider: data.provider } : {}),
     ...(data.degraded && typeof data.degraded === 'object' ? { degraded: data.degraded as RavenReply['degraded'] } : {}),
     ...(data.error ? { error: data.error as RavenReply['error'] } : {}),
+    // Canonical top-level fields first; `metadata` remains the fallback for an older server.
+    ...(Array.isArray(data.trace) ? { trace: data.trace as RavenPhase[] } : {}),
     ...(data.metadata ? { metadata: data.metadata as RavenMetadata } : {}),
   }
   return reply

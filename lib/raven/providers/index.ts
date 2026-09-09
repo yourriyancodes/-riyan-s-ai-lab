@@ -46,18 +46,20 @@ export function resolveProvider(config: RavenConfig = ravenConfig()): ModelProvi
   })
 }
 
-export type ProviderProbe = { reachable: boolean; detail: string; provider: string | null }
+export type ProviderProbe = { reachable: boolean; authorized: boolean | null; detail: string; provider: string | null }
 
 export async function probeProvider(config: RavenConfig = ravenConfig()): Promise<ProviderProbe> {
   const provider = resolveProvider(config)
   if (!provider) {
-    return { reachable: false, detail: config.provider.id ? `provider "${config.provider.id}" selected but incomplete (model or key missing)` : 'no provider configured', provider: null }
+    return { reachable: false, authorized: null, detail: config.provider.id ? `provider "${config.provider.id}" selected but incomplete (model or key missing)` : 'no provider configured', provider: null }
   }
   try {
     const result = await provider.probe()
-    return { ...result, provider: provider.id }
+    // `authorized` stays null when the provider could not tell us anything — an unreadable
+    // endpoint has not been given the chance to accept or refuse the key.
+    return { ...result, authorized: result.authorized ?? null, provider: provider.id }
   } catch (error) {
-    return { reachable: false, detail: `probe threw: ${(error as Error)?.message ?? 'unknown'}`, provider: provider.id }
+    return { reachable: false, authorized: null, detail: `probe threw: ${(error as Error)?.message ?? 'unknown'}`, provider: provider.id }
   }
 }
 

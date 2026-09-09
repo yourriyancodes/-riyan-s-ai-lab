@@ -113,7 +113,16 @@ const isolate = <T>(value: T): T => {
 }
 
 export type RegistryOptions = {
-  defaults?: { timeoutMs?: number; maxOutputChars?: number }
+  defaults?: {
+    timeoutMs?: number
+    maxOutputChars?: number
+    /**
+     * A ceiling on any single step, applied to whatever the tool asked for. `RAVEN_AGENT_STEP_TIMEOUT_MS`
+     * is only worth documenting if setting it can bound a turn, so this is the number that does it:
+     * a tool cannot opt out of it by declaring a longer timeout of its own.
+     */
+    maxTimeoutMs?: number
+  }
   limits?: { maxStringChars?: number }
   /** Audit sink: the brain writes every run here, the recorder persists it. */
   onRun?: (run: ToolRun) => void
@@ -134,7 +143,11 @@ export class ToolRegistry {
     this.tools.set(spec.name, {
       spec,
       handler,
-      timeoutMs: spec.timeoutMs ?? this.options.defaults?.timeoutMs ?? 5000,
+      timeoutMs: (() => {
+        const asked = spec.timeoutMs ?? this.options.defaults?.timeoutMs ?? 5000
+        const ceiling = this.options.defaults?.maxTimeoutMs
+        return ceiling && ceiling > 0 ? Math.min(asked, ceiling) : asked
+      })(),
       maxOutputChars: this.options.defaults?.maxOutputChars ?? 8000,
     })
     return this

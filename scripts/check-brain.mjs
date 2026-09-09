@@ -689,6 +689,29 @@ await check('two failures open the breaker and stop further calls', async () => 
   resetProviderBreaker()
 })
 
+await check('an open breaker skips the endpoint on agentic turns too', async () => {
+  // The router's `genai` gate was not enough on its own: an agentic turn hands its provider straight
+  // to the reasoning agent, so an endpoint that had already failed twice was still dialled on every
+  // plan. Measured live before the fix: 1.5 s of retries per turn, and 76 s for one turn when the
+  // endpoint hung instead of answering. The breaker now holds the handle itself, and the skip is
+  // reported rather than hidden.
+  resetProviderBreaker()
+  const behaviour = { calls: [], mode: 'fail-rate' }
+  const provider = stubProvider(behaviour)
+  const plan = 'Create a plan for improving Riyan\u2019s AI portfolio.'
+  await ask(plan, {}, { providerOverride: provider })
+  await ask(plan, {}, { providerOverride: provider })
+  assert.equal(providerBreakerState().open, true, 'two provider failures should open the breaker')
+  const callsBefore = behaviour.calls.length
+  const result = await ask(plan, {}, { providerOverride: provider })
+  assert.equal(behaviour.calls.length, callsBefore, 'an agentic turn attempted the endpoint while the breaker was open')
+  assert.equal(result.mode, 'agentic', 'the plan must still be answered from tools, not dropped')
+  assert.equal(result.success, true, 'a cooldown is a degradation, not a failure')
+  assert.equal(result.metadata.provider, null, 'a skipped provider cannot be credited with the answer')
+  assert.match(JSON.stringify(result.metadata), /not attempted|cooldown|previously failed|rate_limited/i, 'the skip has to be visible in what the turn reports')
+  resetProviderBreaker()
+})
+
 await check('agentic mode plans, executes tools, and says who synthesized', async () => {
   const behaviour = { calls: [], mode: 'json' }
   const result = await ask('which project best demonstrates retrieval and why?', { providerOverride: stubProvider(behaviour) })
@@ -960,6 +983,27 @@ await check('the SQLite adapter behaves identically to the in-process adapter', 
   sqlite.close()
 })
 
+await check('recentMessages comes back oldest-first from every adapter that runs here', async () => {
+  // The contract `DatabaseAdapter.recentMessages` documents, and that two consumers read
+  // positionally: the prompt builder walks backwards to spend its budget on the newest turns, and
+  // the referent resolver takes the *tail* to find what RAVEN just said. The parity check above
+  // compares adapters with each other, so a reversal shared by all of them would pass it — this one
+  // spells the expected order out, including the same-millisecond pair that needs a tiebreaker.
+  const { mkdtemp } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { createMemoryDatabase } = await import(`${ROOT}/lib/raven/db/memoryStore.ts`)
+  const { createFileDatabase } = await import(`${ROOT}/lib/raven/db/fileStore.ts`)
+  const expected = ['m0', 'm1', 'm2', 'm3', 'm-same-a', 'm-same-b']
+  const directory = await mkdtemp(join(tmpdir(), 'raven-order-'))
+  const adapters = [['in-process', createMemoryDatabase()], ['file-backed', await createFileDatabase(directory)], ['sqlite', await createSqliteDatabase({ path: ':memory:' })]]
+  for (const [name, adapter] of adapters) {
+    const { recent } = await adapterBehaviourScript(adapter)
+    assert.deepEqual(recent, expected, `${name} returned the conversation in the wrong order`)
+    if ('close' in adapter && typeof adapter.close === 'function') adapter.close()
+  }
+})
+
 await check('the SQLite schema is derived from the Postgres one, column for column', async () => {
   // The raw handle, not the adapter: this test is about the DDL translation itself, and the
   // adapter deliberately exposes no query surface for a test to lean on.
@@ -1092,6 +1136,219 @@ await check('RAVEN_DB_DRIVER accepts every real driver name, including postgres-
 })
 
 // ---------------------------------------------------------------------------
+group('13. Final integration: context, ceilings, and the states a turn may claim')
+
+const { resolveProjectReferent } = await import(`${ROOT}/lib/raven/intent.ts`)
+const { planAgentSteps } = await import(`${ROOT}/lib/raven/agents/reasoning.ts`)
+
+await check('the two documented timeout budgets actually bound a turn', async () => {
+  // RAVEN_AGENT_STEP_TIMEOUT_MS and RAVEN_AGENT_TURN_TIMEOUT_MS were read out of the environment and
+  // then never referenced: the numbers in `.env.example` bound nothing, and anything that stalled
+  // held the turn for its own internal budget (measured: 76 s for one plan turn against a hung
+  // endpoint). Both budgets are enforced now — the step ceiling clamps even a tool that asked for
+  // longer, and the turn ceiling races the agent and answers from what retrieval already returned.
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const { ToolRegistry } = await import(`${ROOT}/lib/raven/tools/registry.ts`)
+  const base = ravenConfig()
+
+  const sandbox = new ToolRegistry({ defaults: { timeoutMs: 4000, maxTimeoutMs: 120 } })
+  sandbox.register({ name: 'slow_but_confident', description: 'asks for a timeout the ceiling refuses to grant', permission: 'read', parameters: {}, timeoutMs: 3000 }, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+    return { output: { said: 'too late' } }
+  })
+  const outcome = await sandbox.execute({ tool: 'slow_but_confident', input: {} }, { sessionId: 's', conversationId: 'c', adapter: null, agentRunId: null, approvedActions: new Set(), now: () => new Date().toISOString(), config: base })
+  assert.equal(outcome.status, 'timeout', `a 3 s tool ran under a 120 ms ceiling: status=${outcome.status}`)
+  assert.ok(outcome.ms < 900, `the ceiling was not the bound (ms=${outcome.ms})`)
+
+  const config = { ...base, limits: { ...base.limits, agentStepTimeoutMs: 4000, agentTurnTimeoutMs: 150 } }
+  const hungProvider = {
+    id: 'hang',
+    label: 'Hangs forever',
+    probe: async () => ({ reachable: true, detail: 'stub' }),
+    generate: () => new Promise(() => {}),
+  }
+  const started = Date.now()
+  const turn = await runBrainTurn({ message: 'Create a plan for improving Riyan\u2019s AI portfolio.', sessionId: `budget-${Date.now()}`, skipPersistence: true }, { config, providerOverride: hungProvider })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 2500, `a 150 ms turn budget let the turn run ${elapsed} ms`)
+  assert.equal(turn.degraded?.from, 'agentic', `the overrun is not reported (degraded=${JSON.stringify(turn.degraded)})`)
+  assert.match(turn.degraded?.because ?? '', /turn budget/i, 'the report has to name which budget ran out')
+  assert.ok(turn.response.length > 10, 'a turn that ran out of budget still has to say something')
+  // What it says is decided by what retrieval actually returned, and the mode has to follow that
+  // rather than the plan: a cited knowledge answer, or an honest refusal with nothing attached.
+  if (turn.mode === 'knowledge') assert.ok(turn.citations.length > 0, 'a knowledge answer must arrive with the records it used')
+  else {
+    assert.equal(turn.mode, 'offline', `an overrun with nothing grounded to say must not report ${turn.mode}`)
+    assert.equal(turn.success, false, 'a refusal is not a success')
+    assert.equal(turn.citations.length, 0, 'a refusal may not wear the records it did not use')
+  }
+})
+
+await check('the referent window is counted in answers, not in rows', () => {
+  // “And what about the first one?” arrives one turn after the listing, with an unrelated
+  // acknowledgement in between. Counting the window in table rows spent two of three slots on that
+  // pair and lost the listing, so the ordinal resolved against the wrong answer. The candidates are
+  // therefore the last few things RAVEN *said*.
+  const turns = [
+    { role: 'user', content: 'What projects has Riyan built?' },
+    { role: 'raven', content: '5 project(s) on this portfolio: - 01 Akshara Deepa Tutor — a learning system - 03 RAG Knowledge Assistant — retrieval pipeline' },
+    { role: 'user', content: 'Which one uses RAG?' },
+    { role: 'raven', content: 'RAG Knowledge Assistant (03) — RETRIEVAL / AI, status TESTING.' },
+    { role: 'user', content: 'Remember that I benchmark retrieval latency.' },
+    { role: 'raven', content: 'Stored 1 item(s) in sqlite persistence: note.benchmark_retrieval_latency.' },
+  ]
+  const first = resolveProjectReferent('And what about the first one?', turns)
+  assert.equal(first?.name, 'Akshara Deepa Tutor', `the ordinal resolved to “${first?.name}” — it lost the listing two turns back`)
+  assert.equal(first?.how, 'ordinal', `“the first one” should resolve positionally, got ${first?.how}`)
+  // A tie between candidates is not a resolution.
+  assert.equal(resolveProjectReferent('it', [{ role: 'raven', content: 'Akshara Deepa Tutor and RAG Knowledge Assistant are both listed.' }]), null)
+  // One turn further out, with an unrelated exchange in between, the ordinal still points at the list.
+  const later = [
+    ...turns,
+    { role: 'user', content: 'What is Riyan’s email address?' },
+    { role: 'raven', content: 'No contact link or email is published in the portfolio data yet.' },
+  ]
+  const second = resolveProjectReferent('Now tell me about the second one.', later)
+  assert.equal(second?.name, 'RAG Knowledge Assistant', `the listing two answers back was lost: got “${second?.name}”`)
+  assert.equal(second?.how, 'ordinal')
+  // An ordinal past the end of the list is not a question about this corpus.
+  assert.equal(resolveProjectReferent('And the ninth one?', later), null, 'a two-item list cannot have a ninth entry')
+})
+
+await check('a follow-up is resolved from the previous answer instead of refused', async () => {
+  const sessionId = `ctx-${Date.now()}`
+  const conversationId = `conv-${sessionId}`
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  await runBrainTurn({ message: 'What projects has Riyan built?', sessionId, conversationId })
+  const follow = await runBrainTurn({ message: 'Which one uses RAG?', sessionId, conversationId })
+  assert.equal(follow.metadata.intent, 'portfolio.project', `the follow-up stayed ${follow.metadata.intent}; context was ignored`)
+  assert.match(follow.response, /RAG Knowledge Assistant/, `the referent was not carried into the answer: ${follow.response.slice(0, 160)}`)
+  assert.ok(follow.citations.length > 0, 'a resolved answer must still cite the record it came from')
+  assert.ok(follow.metadata.trace.some((event) => event.phase === 'anaphora'), 'the resolution is invisible in the trace')
+  const anaphora = follow.metadata.trace.find((event) => event.phase === 'anaphora')
+  assert.match(anaphora.note ?? '', /resolved/i, 'the trace event does not say what it resolved')
+
+  // And the negative half: the same words with no previous answer must NOT invent a subject.
+  const cold = await runBrainTurn({ message: 'Which one uses RAG?', sessionId: `cold-${Date.now()}`, conversationId: 'cold-conv' })
+  assert.notEqual(cold.metadata.intent, 'portfolio.project', 'a referential question was answered from nothing')
+  assert.equal(cold.success, false, 'a follow-up with no antecedent should be an honest refusal')
+})
+
+await check('the referent resolver abstains rather than guessing', async () => {
+  const recent = [{ role: 'raven', content: '5 project(s) on this portfolio: RAG Knowledge Assistant and Akshara Deepa Tutor.' }]
+  assert.equal(resolveProjectReferent('What is the population of Jakarta?', recent), null, 'a self-contained question was rewritten')
+  assert.equal(resolveProjectReferent('which one?', []), null, 'a follow-up with no previous answer resolved to something')
+  assert.equal(resolveProjectReferent('which one?', [{ role: 'raven', content: 'I have no projects listed here.' }]), null, 'a referent was invented from the corpus rather than the answer')
+  const ordinal = resolveProjectReferent('what about the first one?', recent)
+  assert.equal(ordinal?.how, 'ordinal', 'an ordinal follow-up was not resolved by position')
+  assert.equal(ordinal?.name, 'RAG Knowledge Assistant', 'the first project in the answer is not the first project chosen')
+})
+
+await check('a turn that executed nothing cannot claim EXECUTING', async () => {
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const idle = await runBrainTurn({ message: 'thanks', sessionId: 'exec-none-1' })
+  assert.deepEqual(idle.tools, [], 'no tool was expected for a pleasantry')
+  assert.equal(idle.metadata.trace.some((event) => event.state === 'EXECUTING'), false, 'EXECUTING was entered with nothing executed')
+  assert.equal(idle.metadata.trace.some((event) => event.state === 'VERIFYING' && /\b0 tool run/.test(event.note ?? '')), false, 'VERIFYING claimed a check against zero runs')
+
+  const answered = await runBrainTurn({ message: 'What technologies does Riyan use?', sessionId: 'exec-some-1' })
+  assert.ok(answered.tools.length > 0, 'this turn should have run a tool for the comparison to mean anything')
+  const executed = answered.metadata.trace.filter((event) => event.state === 'EXECUTING')
+  if (executed.length) {
+    const outcome = answered.metadata.trace.find((event) => event.phase === 'actions-outcome')
+    assert.ok(outcome, 'EXECUTING appeared without a following actions-outcome event')
+    assert.match(outcome.note ?? '', /\d+\/\d+ run\(s\) succeeded/, 'the outcome event does not carry counts')
+  }
+})
+
+await check('every tool is registered, bounded, and cannot touch the machine', async () => {
+  // A tool description may legitimately say the *client* executes a scroll; what must not
+  // exist is a tool that can touch this machine. So the test looks for capability, not verbs.
+  const forbidden = /\bshell\b|child_process|execSync|spawnSync|\bspawn\(|unlinkSync|rmSync|rmdir|writeFileSync|appendFile|node:fs|\bnet\b|\bdbus\b/i
+  for (const entry of TOOL_SPECS) {
+    const spec = entry.spec
+    assert.ok(['read', 'compute', 'action'].includes(spec.permission), `${spec.name} declares permission ${spec.permission}`)
+    assert.ok(typeof spec.timeoutMs === 'number' && spec.timeoutMs > 0 && spec.timeoutMs <= 8000, `${spec.name} has no usable timeout`)
+    assert.ok(!forbidden.test(`${spec.name} ${spec.description}`), `${spec.name} advertises machine access, which this backend does not have`)
+    if (spec.permission === 'action') {
+      const touchesThePage = spec.name === 'request_navigation'
+      assert.equal(Boolean(spec.requiresApproval), touchesThePage, `${spec.name} has the wrong approval policy`)
+    }
+  }
+  const names = TOOL_SPECS.map((entry) => entry.spec.name)
+  // The spec's capability list, by the names this registry actually uses: `get_profile` is its
+  // "get_about", and the memory pair is `remember_fact`/`forget_fact` rather than
+  // save/recall, because expiring a fact is a different operation from saving one.
+  for (const required of ['list_projects', 'get_project', 'get_skills', 'get_profile', 'get_contact', 'search_knowledge', 'recall_memories', 'remember_fact', 'system_status']) {
+    assert.ok(names.includes(required), `${required} disappeared from the registry`)
+  }
+})
+
+await check('a plan is bounded by the step ceiling no matter how it is asked', async () => {
+  const limit = ravenConfig().limits.agentMaxSteps
+  const monster = 'Plan everything: fetch every project, summarise each skill, rewrite the roadmap, add auth, deploy it, benchmark it, and explain each step in detail.'
+  const intent = classifyIntent(monster)
+  const plan = planAgentSteps({ intent, message: monster, alreadyRan: new Set() })
+  assert.ok(plan.steps.length > 0, 'the planner produced no steps for an explicitly plan-shaped request')
+  assert.ok(plan.steps.length <= limit, `the planner emitted ${plan.steps.length} steps against a ceiling of ${limit}`)
+  for (const step of plan.steps) {
+    assert.equal(typeof step.tool, 'string', 'a plan step without a tool is not executable')
+    assert.ok(TOOL_SPECS.some((entry) => entry.spec.name === step.tool), `plan step ${step.tool} is not a registered tool`)
+  }
+})
+
+await check('a near-miss refusal reports offline, not knowledge', async () => {
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const turn = await runBrainTurn({ message: 'How does Riyan configure Kubernetes operators for quantum annealers?', sessionId: 'near-miss-1' })
+  assert.equal(turn.success, false, 'an ungrounded turn cannot be reported as a success')
+  assert.equal(turn.mode, 'offline', `mode was ${turn.mode}: an ungrounded answer must not be called knowledge`)
+  assert.equal(turn.state, 'OFFLINE', 'the state has to follow the mode or the UI lights up for nothing')
+  assert.equal(turn.citations.length, 0, 'a refusal may not wear the sources it rejected')
+  assert.equal(turn.verified, false)
+  assert.equal(turn.degraded?.from, 'knowledge', 'the turn should say what it fell back from')
+  assert.match(turn.response, /Offline\/local reasoning is active/i, 'item 18: an offline refusal has to say so out loud')
+  assert.match(turn.metadata.trace[turn.metadata.trace.length - 1].phase, /no-evidence|offline/i, 'the trace ended somewhere unexpected')
+})
+
+await check('every table survives a restart of the process', async () => {
+  const { createSqliteDatabase } = await import(`${ROOT}/lib/raven/db/sqlite.ts`)
+  const directory = await mkdtemp(join(tmpdir(), 'raven-persist-'))
+  const path = join(directory, 'brain.db')
+  const now = new Date(0).toISOString()
+  const first = await createSqliteDatabase({ path })
+  await first.upsertConversation({ id: 'pc', sessionId: 'ps', title: 'a title', createdAt: now, updatedAt: now })
+  await first.appendMessage({ id: 'pm', conversationId: 'pc', role: 'raven', content: 'a reply', mode: 'agentic', state: 'SPEAKING', createdAt: now })
+  await first.remember({ id: 'pr', sessionId: 'ps', key: 'preference.db', value: 'SQLite', importance: 0.7, source: 'explicit', createdAt: now, updatedAt: now })
+  await first.startAgentRun({ id: 'pa', conversationId: 'pc', goal: 'a goal', mode: 'agentic', status: 'running', startedAt: now, completedAt: null, steps: [{ id: '1', action: 'search_knowledge', tool: 'search_knowledge', status: 'ok' }], toolsUsed: ['search_knowledge'], verified: false, result: '' })
+  await first.recordToolRun({ id: 'pt', agentRunId: 'pa', conversationId: 'pc', toolName: 'search_knowledge', input: { q: 'x' }, output: { hits: 2 }, status: 'succeeded', ms: 4, startedAt: now, finishedAt: now })
+  await first.finishAgentRun({ id: 'pa', conversationId: 'pc', goal: 'a goal', mode: 'agentic', status: 'verified', startedAt: now, completedAt: now, steps: [{ id: '1', action: 'search_knowledge', tool: 'search_knowledge', status: 'ok' }], toolsUsed: ['search_knowledge'], verified: true, result: 'done' })
+  first.close()
+
+  const reopened = await createSqliteDatabase({ path })
+  const [conversation] = await reopened.listConversations('ps', 5)
+  assert.equal(conversation?.title, 'a title', 'conversation did not survive')
+  const [message] = await reopened.recentMessages('pc', 5)
+  assert.equal(message?.content, 'a reply', 'message did not survive')
+  assert.equal(message?.mode, 'agentic', 'per-message mode was lost')
+  const [memory] = await reopened.recallMemories('ps', 5)
+  assert.equal(memory?.value, 'SQLite', 'memory did not survive')
+  // The run audit is the part people forget to persist, and the only thing that can prove a
+  // claim after the fact, so it is checked with the same seriousness as the chat rows.
+  const { DatabaseSync } = await import('node:sqlite')
+  const raw = new DatabaseSync(path, { readOnly: true })
+  const run = raw.prepare('SELECT status, verified, steps, tools_used FROM raven_agent_runs WHERE id = ?').get('pa')
+  assert.equal(run.status, 'verified', 'agent run did not survive its own finish')
+  assert.equal(Number(run.verified), 1, 'the verified flag was lost')
+  assert.equal(JSON.parse(run.steps)[0].tool, 'search_knowledge', 'the step list did not survive as JSON')
+  const toolRun = raw.prepare('SELECT tool_name, status, ms, input FROM raven_tool_runs WHERE id = ?').get('pt')
+  assert.deepEqual({ tool: toolRun.tool_name, status: toolRun.status, ms: toolRun.ms }, { tool: 'search_knowledge', status: 'succeeded', ms: 4 }, 'tool run did not survive')
+  assert.deepEqual(JSON.parse(toolRun.input), { q: 'x' }, 'tool input JSON did not round-trip')
+  raw.close()
+  reopened.close()
+  await rm(directory, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
 group('12. Intent coverage the browser actually exercises')
 
 await check('capability questions reach system_status instead of a pleasantry', async () => {
@@ -1132,6 +1389,33 @@ await check('short unmatched questions are \u201cunknown\u201d, not silently sma
   const refused = await ask('What is my bank balance?', { sessionId: 'ses-un', conversationId: 'conv-un' })
   assert.equal(refused.success, false, 'an ungroundable question claimed success')
   assert.match(refused.response, /invent|ground/i, 'the refusal did not say it refused to invent')
+})
+
+await check('an exclusion phrase (“outside the portfolio”) never gets answered with the list', async () => {
+  // Vocabulary scoring alone reads `portfolio` in “tell me something outside the portfolio” and
+  // answers an edge-of-knowledge question with a project listing. The guard removes the
+  // portfolio-shaped intents, so the turn is classified `unknown` and answered by the same path as
+  // any other ungrounded question: retrieval, then a refusal if the corpus has nothing. The
+  // suppression is reported in the signals rather than hidden inside the classifier.
+  const asked = classifyIntent('Tell me something outside the portfolio knowledge base.')
+  assert.equal(asked.intent, 'unknown', 'an outside-the-portfolio request must not become a project list')
+  assert.ok(asked.signals.some((sig) => sig.startsWith('suppress:outside-scope')), 'the suppression itself must be visible in the trace')
+  assert.equal(asked.entities.unanswerableByCorpus, 'outside-scope', 'the reason has to travel with the turn to the composer')
+  // A question about work that does not exist yet is not a question about the records either.
+  const future = classifyIntent('Suggest a CLI architecture for my next project.')
+  assert.equal(future.intent, 'unknown', 'a design question about a future project must not become a project listing')
+  assert.ok(future.signals.some((sig) => sig.startsWith('suppress:hypothetical')), 'the hypothetical demotion must be reported too')
+  // Both markers have to change the *answer*, not just the label: with no provider the composer may
+  // not fall back to “here are some records that share a word with you”.
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  for (const [message, session] of [['Tell me something outside the portfolio knowledge base.', 'suppress-1'], ['Suggest a CLI architecture for my next project.', 'suppress-2']]) {
+    const turn = await runBrainTurn({ message, sessionId: session })
+    assert.equal(turn.mode, 'offline', `“${message}” was answered in ${turn.mode} mode`)
+    assert.equal(turn.success, false, `“${message}” has nothing grounded to say and must not report success`)
+    assert.equal(turn.citations.length, 0, 'a refusal may not wear sources it did not use')
+  }
+  for (const q of ['What has Riyan built in his portfolio?', 'what skills are on the portfolio page?', 'show me projects beyond the web apps'])
+    assert.notEqual(classifyIntent(q).intent, 'unknown', `“${q}” is still answerable and must not be suppressed`)
 })
 
 // ---------------------------------------------------------------------------

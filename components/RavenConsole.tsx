@@ -24,6 +24,8 @@ const CAPABILITY_FLAGS: Array<[keyof RavenHealth, string, string, string]> = [
   ['providerConfigured', 'LLM KEY', 'PRESENT', 'ABSENT'],
   ['providerAdapterImplemented', 'ADAPTER', 'WIRED', 'NOT WIRED'],
   ['providerReachable', 'LLM REACH', 'YES', 'NO'],
+  // Only rendered when the backend actually probed: see the filter below.
+  ['providerAuthorized', 'LLM AUTH', 'ACCEPTED', 'REFUSED'],
   ['databaseConfigured', 'DATABASE', 'CONFIGURED', 'NOT CONFIGURED'],
   ['databaseReachable', 'DB REACH', 'YES', 'NO'],
   ['voiceConfigured', 'VOICE', 'CONFIGURED', 'NOT CONFIGURED'],
@@ -290,7 +292,7 @@ export default function RavenConsole() {
             >
               STATUS: {health.status}
             </span>
-            {CAPABILITY_FLAGS.map(([key, label, on, off]) => {
+            {CAPABILITY_FLAGS.filter(([key]) => !(key === 'providerAuthorized' && health[key] === null)).map(([key, label, on, off]) => {
               const value = Boolean(health[key])
               return (
                 <span

@@ -19,7 +19,12 @@ export type KnowledgeInput = {
   navigation?: { section: string; approved: boolean; targetPresent: boolean } | null
 }
 
-export type KnowledgeAnswer = { answer: string; citations: Citation[]; toolsUsed: string[]; note?: string }
+/**
+ * `ungrounded` marks text that explains a *failure to answer*. It is deliberately not
+ * `null` — the sentence is worth reading — but the brain must not dress it up as a
+ * knowledge answer, because "I found nothing" is not knowledge.
+ */
+export type KnowledgeAnswer = { answer: string; citations: Citation[]; toolsUsed: string[]; note?: string; ungrounded?: boolean }
 
 const BULLET = '\n- '
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text)
@@ -113,13 +118,13 @@ export function composeKnowledgeAnswer(input: KnowledgeInput): KnowledgeAnswer |
     case 'capability.probe': {
       const status = data(retrieval, 'system_status')
       if (!status) return null
-      const provider = pick<{ configured: boolean; label: string; model: string | null }>(status, 'provider')
+      const provider = pick<{ configured: boolean; label: string; model: string | null; failing?: boolean }>(status, 'provider')
       const database = pick<{ driver: string | null; reachable: boolean; detail: string }>(status, 'database')
       const knowledge = pick<{ documents: number; projects: number; skillNodes: number; glossaryEntries: number }>(status, 'knowledge')
       const lines = [
         provider?.configured
-          ? `Provider: ${provider.label}${provider.model ? ` (${provider.model})` : ''} — configured and will be used when it adds something.`
-          : 'Provider: none configured, so every answer here comes from the deterministic local engines.',
+          ? `Provider: ${provider.label}${provider.model ? ` (${provider.model})` : ''} — configured${provider.failing ? ', but its recent calls have been refused, so this answer and the next few are local' : ' and used where it adds something'}.`
+          : 'Provider: none configured — offline/local reasoning is active, and every answer here comes from the deterministic local engines.',
         `Database: ${database?.driver ?? 'unresolved'} — ${database?.reachable ? 'reachable' : 'not reachable'}${database?.detail ? ` (${clip(database.detail, 140)})` : ''}.`,
         knowledge
           ? `Knowledge corpus: ${knowledge.documents} documents, ${knowledge.projects} projects, ${knowledge.skillNodes} skill nodes, ${knowledge.glossaryEntries} glossary entries.`
@@ -292,9 +297,10 @@ export function composeKnowledgeAnswer(input: KnowledgeInput): KnowledgeAnswer |
           : []
         if (!mentioning.length) {
           return {
-            answer: `The glossary has no entry for "${asked || 'that term'}", and none of the ${hits.length} record(s) the search returned actually mention it, so there is nothing grounded to say. ${hits.slice(0, 2).map((hit) => `${hit.title} is about something else`).join('; ')}.`,
+            answer: `The glossary has no entry for "${asked || 'that term'}", and none of the ${hits.length} record(s) the search returned actually mention it.`,
             citations: [],
             toolsUsed,
+            ungrounded: true,
             note: 'glossary missed and no corpus record contains the term; refused instead of listing near-misses',
           }
         }
@@ -315,6 +321,14 @@ export function composeKnowledgeAnswer(input: KnowledgeInput): KnowledgeAnswer |
     default: {
       // These reach the composer only when the agentic path is unavailable; a corpus
       // answer is still better than a model guessing, and worse than nothing at all.
+      if (intent.entities?.unanswerableByCorpus)
+        // "Something outside the portfolio" and "an architecture for my next project" both point past
+        // these records: the first at what is absent, the second at work that does not exist yet. A hit
+        // that merely shares the word "portfolio" answers neither, so this returns null and the caller
+        // refuses — no invented record, no listing dressed up as a reply. With a provider configured
+        // the turn does not land here at all: the same `unknown` intent routes to `genai`, which
+        // answers it and is labelled as synthesis.
+        return null
       const search = data(retrieval, 'search_knowledge')
       const hits = (pick<{ title: string; body: string; score: number; phraseMatch?: boolean }[]>(search ?? {}, 'hits') ?? []).filter(
         // A generic question needs a real match: one shared word is not an answer,

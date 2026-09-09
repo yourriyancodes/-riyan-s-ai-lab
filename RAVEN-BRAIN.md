@@ -104,6 +104,74 @@ otherwise (see §7 and §13).
    for no claim. `citations` is empty on that path now; `tools` still shows what ran,
    because that part happened.
 
+### 1.3 Final round: grounding enforcement, provider truth, and conversational context
+
+Eighteen review items; five of them turned out to be real defects, and each is now asserted
+somewhere in `npm run check`:
+
+1. **An ungrounded answer used to be reported as an answer.** The `explain.concept` near-miss path
+   (glossary empty, search returned records that did not contain the term) returned its
+   "nothing mentions it" text with `mode:'knowledge'`, HTTP 200, `verified:true` and four
+   citations — a refusal wearing the receipts of the evidence it had just rejected. `KnowledgeAnswer`
+   now carries `ungrounded?: boolean`, and `brain.ts` turns any such answer into the refusal it
+   describes: `mode:'offline'`, `state:'OFFLINE'`, `success:false` (HTTP 502), `citations:[]`,
+   `verified:false`, `degraded:{from:'knowledge',because:'the composer found nothing grounded to say'}`.
+   The near-miss opening line is kept, because it is the specific truth of that question.
+2. **`providerReachable` meant "the endpoint answered HTTP", and that is not what a reader takes
+   from it.** A wrong key produces 401 from a perfectly reachable endpoint. `probe()` now returns
+   `{ reachable, detail, authorized? }` — `authorized:false` on 401/403, `undefined` when the probe
+   could not judge (no provider, connection failure) — published by `/api/health` as
+   `providerAuthorized` plus `provider.probed.{reachable,authorized,detail}`. `READY` requires
+   `authorized === true`, so a configured-but-refused key reports `PARTIALLY_READY` and says so:
+   *"The provider endpoint answered but rejected the credentials (401/403)."* The flag lives on the
+   measured health block, not in `describeCapabilities()`, which stays a pure description of config.
+3. **The breaker only ever constrained the router.** An agentic turn handed its provider straight to
+   the reasoning agent, so an endpoint that had already failed twice was dialled again on every
+   plan: measured 1.5 s of retries per turn, and **76 s** for one turn when the endpoint hung rather
+   than answered (25 s timeout × 3 attempts). Two changes: the breaker moved to `lib/raven/breaker.ts`
+   so `system_status` can report it without importing the brain, and while it is open the brain hands
+   the agent `heldByBreaker(provider)` — a handle that fails on contact with
+   `not attempted: N consecutive failure(s), retrying after Xs of cooldown` instead of making the
+   user wait. `requestJson` also stopped retrying timeouts (a 500 still uses the retry budget:
+   "a timeout costs one attempt; a 5xx may use the retry budget").
+   `RAVEN_AGENT_STEP_TIMEOUT_MS` and `RAVEN_AGENT_TURN_TIMEOUT_MS` were documented in `.env.example`
+   and read by nothing — a budget nobody enforces is worse than no budget, because it is believed.
+   The step ceiling now clamps every tool at registration (a tool cannot opt out by declaring a
+   longer number of its own) and the turn ceiling races the agent loop: on overrun the agent is
+   abandoned, the turn answers from what retrieval had already returned, the mode becomes whatever
+   actually delivered (`knowledge`, or `offline` when nothing did), and `degraded` names the budget.
+4. **Follow-up questions had no referent resolution.** "Which one uses RAG?" after a listing scored
+   `unknown 0.05` and was refused, because the classifier only reads the current message.
+   `resolveProjectReferent(text, recent)` in `intent.ts` now runs when — and only when — the intent
+   is `unknown` or confidence is below 0.35: candidates are the projects *that RAVEN's own recent
+   answers named* (bounded: 3 answers for pronouns, up to 5 for an ordinal), an ordinal is resolved
+   by position **in that listing**, a term match beats a fuzzy one, and a tie or an out-of-range
+   ordinal abstains. When it resolves, the intent is re-classified, `entities.project` is overridden,
+   a `anaphora` phase event enters the trace, and the retrieval plan runs against the resolved
+   subject. It never overrides a question that has its own subject.
+5. **Two question shapes were answered by the wrong thing.** "Tell me something *outside* the
+   portfolio" was answered with the project list (vocabulary scoring sees `portfolio`), and "suggest
+   a CLI architecture for my *next* project" was answered with the same list. `classifyIntent` now
+   drops portfolio-shaped intents for both, records the reason (`suppress:outside-scope:…` in the
+   signals, `entities.unanswerableByCorpus`), and the composer returns nothing for those turns — so
+   with no provider they are refused, and with one they route to `genai` and are labelled as
+   synthesis. The corpus is not allowed to answer a question about what is not in it.
+6. **Refusals now name the mode.** Every no-grounding refusal ends with `ungroundedNotice(config)`:
+   which offline/local mode is active, that no provider is configured, and what this brain can
+   actually answer. "Model offline" in a README is not enough when a user is staring at one shrug.
+7. **The state machine could claim a state it had not earned.** `VERIFYING` is entered only when a
+   turn actually has runs or citations to check; otherwise the same work is recorded as a plain
+   `verification` phase event. `actions-outcome` was a `ProposedAction[]` the client had to
+   interpret — it is now a trace event reporting `succeeded/total`, failures, awaiting-approval,
+   stored and expired counts, measured after `runActions`.
+8. Two claims were checked and found already true, so nothing changed for them: memory is selected by
+   relevance and bounded (`loadContext` scores against the question's terms, falls back to top-importance
+   only on zero matches, and both provider paths receive `context.memories`); and the console renders
+   only measured state — no simulated telemetry, and the vision path degrades to a labelled "vision
+   unavailable" panel with metadata (never frames) leaving the browser.
+
+---
+
 ---
 
 ## 2. Layer map
@@ -348,9 +416,35 @@ inside `RAVEN_CONTEXT_CHAR_BUDGET`, and when material is dropped the prompt says
 explicitly (`…N further source(s) trimmed for context budget…`).
 
 A model's output is **evidence-shaped, not authoritative**: it is composed, then handed to
-the same verifier as everything else. Two consecutive failures open a per-process breaker
-for 60 seconds; while it is open the router stops preferring `genai`, `metadata.route.
-reasons` says why, and `/api/health` reports `breaker.open`.
+the same verifier as everything else.
+
+**Availability is three separate facts**, because collapsing them lies to the reader:
+
+| published as | true when | false / null when |
+| --- | --- | --- |
+| `providerConfigured` | a key resolves from the environment | nothing set |
+| `providerReachable` | the endpoint answered HTTP at all | connection refused, DNS failure, timeout |
+| `providerAuthorized` | the endpoint answered *us* (served model list) | `false` on 401/403; `null` when unmeasurable (no provider, no connection) |
+
+`/api/health` is the only place that probes, and only on `PUT`/first read — never on
+`GET /api/raven`, so answering a question cannot pay for a health check. `READY` requires
+`providerAuthorized === true`: a present-but-refused key is `PARTIALLY_READY` with the reason
+in `note`. The flags live on the measured block, not in `describeCapabilities()`, which
+remains a static description of configuration and must stay that way.
+
+**The breaker** (`lib/raven/breaker.ts`, in-process, no network) opens after
+`FAILURE_THRESHOLD = 2` consecutive failures and holds for `OPEN_MS = 60_000`; the first
+success closes it. While it is open: the router stops preferring `genai`, the agentic and
+synthesis paths receive `heldByBreaker(provider)` — a handle that returns a structured
+`unavailable` failure with `not attempted: … retrying after Xs of cooldown` instead of
+dialling out — `system_status` reports `failing`/`consecutiveFailures`, and
+`x-raven-breaker: open` is on the response. Every one of those is a measurement of the same
+state, read from the module that owns it rather than duplicated.
+
+**Retries are asymmetric on purpose**: `requestJson` spends the `RAVEN_MAX_RETRIES` budget on
+transport errors and retryable statuses (408/425/429/5xx, `Retry-After` wins over backoff), but a
+`timeout` returns immediately. Retrying an endpoint that is already not answering tripled the wait
+for one turn — `RAVEN_TIMEOUT_MS` is what a user should be able to reason about as the ceiling.
 
 `RAVEN_API_KEY` never enters the serializable config object — `ravenConfig()` reports
 `apiKeyPresent` and only `ravenApiKey()` returns the value, to the one caller that needs
@@ -570,11 +664,12 @@ No model, no database, no network needed:
 
 ```bash
 npm run check            # typecheck + schema drift + assets + speech + face + brain + backend
-npm run check:brain      # 79 checks: states, intents, retrieval, tools, memory, drivers
+npm run check:brain      # 91 checks: states, intents, retrieval, tools, memory, drivers
                          #   (including the SQLite one and its schema-parity proof), honesty,
                          #   degradation, canonical response contract, deterministic voice
-                         #   selection, concurrency, and the intent shapes the browser types
-npm run check:backend    # 31 checks: Gemini + OpenAI-compatible transports against a real
+                         #   selection, concurrency, referent resolution, and the intent shapes
+                         #   the browser types
+npm run check:backend    # 35 checks: Gemini + OpenAI-compatible transports against a real
                          #   local HTTP server, Supabase REST over real HTTP, both routes,
                          #   the one-line-per-turn log, and a rejection's field set
 npm run typecheck

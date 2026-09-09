@@ -30,6 +30,10 @@ export async function GET(request: Request): Promise<Response> {
   const database = await inspectDatabase(config)
   const providerProbe = shouldProbe ? await probeProvider(config) : null
   const providerReachable = providerProbe ? providerProbe.reachable : false
+  // Three separate facts, because collapsing them is what made a rejected key look like a
+  // working model. `authorized` is null when no probe ran or the endpoint never got to
+  // judge the credential — null is "unknown", and it is printed as such rather than as false.
+  const providerAuthorized = providerProbe ? providerProbe.authorized : null
 
   const body = {
     ok: true,
@@ -46,7 +50,7 @@ export async function GET(request: Request): Promise<Response> {
       label: capabilities.providerLabel,
       model: capabilities.providerModel,
       baseUrl: config.provider.baseUrl,
-      probed: providerProbe ? { reachable: providerProbe.reachable, detail: providerProbe.detail } : null,
+      probed: providerProbe ? { reachable: providerProbe.reachable, authorized: providerProbe.authorized, detail: providerProbe.detail } : null,
       breaker: providerBreakerState(),
     },
     database: {
@@ -62,25 +66,31 @@ export async function GET(request: Request): Promise<Response> {
     providerConfigured: capabilities.providerConfigured,
     providerAdapterImplemented: capabilities.providerAdapterImplemented,
     providerReachable,
+    providerAuthorized,
     databaseConfigured: capabilities.databaseConfigured,
     databaseReachable: database.reachable,
     voiceConfigured: capabilities.voiceConfigured,
     // There is no owner/admin role in this build, so it is reported unset rather than
     // implied by the presence of a key.
     ownerAuthConfigured: false,
+    // A key the endpoint refuses is not a live provider, so READY requires the third fact.
+    // `authorized: null` (never probed) also cannot earn READY — only a probe that came back
+    // "yes, this credential works" does.
     status:
-      capabilities.providerConfigured && providerReachable && database.reachable
+      capabilities.providerConfigured && providerReachable && providerAuthorized === true && database.reachable
         ? 'READY'
         : capabilities.providerConfigured || database.reachable
           ? 'PARTIALLY_READY'
           : 'OFFLINE',
     note: !capabilities.providerConfigured
-      ? 'No provider configured: every answer comes from the deterministic knowledge and agent layers.'
-      : !providerReachable
-        ? 'A provider key exists but the endpoint did not answer; the brain degrades to local knowledge.'
-        : database.reachable
-          ? 'Knowledge, provider and persistence are all live.'
-          : 'Provider live, persistence degraded to its fallback store.',
+      ? 'Offline/local reasoning is active: no provider configured, so every answer comes from the deterministic knowledge and agent layers.'
+      : providerReachable && providerAuthorized === false
+        ? 'The provider endpoint answered but rejected the credentials (401/403). The key is present and unusable; the brain degrades to local knowledge.'
+        : !providerReachable
+          ? 'A provider key exists but the endpoint did not answer; the brain degrades to local knowledge.'
+          : database.reachable
+            ? 'Knowledge, provider and persistence are all live.'
+            : 'Provider live, persistence degraded to its fallback store.',
     knowledge: corpusStats(),
     tools: TOOL_SPECS.map((entry) => ({ name: entry.spec.name, permission: entry.spec.permission, requiresApproval: Boolean(entry.spec.requiresApproval) })),
     states: RAVEN_STATES,

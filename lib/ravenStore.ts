@@ -168,14 +168,20 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
       // no provider and no database, so a missing key is a capability note below, not
       // an outage — and the console must not claim offline when it is working.
       const knowledgeLive = Boolean(data.knowledge && data.knowledge.documents > 0)
-      const providerLive = Boolean(data.providerConfigured && data.providerReachable)
+      // Reachability alone would call a refused key "live": the endpoint answered, so it is
+      // reachable, and the credential is what failed. `providerAuthorized === false` is the
+      // difference between a model RAVEN can use and a 401 waiting for it.
+      const providerLive = Boolean(data.providerConfigured && data.providerReachable && data.providerAuthorized !== false)
+      const keyRefused = Boolean(data.providerConfigured && data.providerReachable && data.providerAuthorized === false)
       set({
         isOnline: knowledgeLive || providerLive,
         healthMessage: providerLive
           ? 'RAVEN brain online — knowledge engine + provider live'
-          : knowledgeLive
-            ? 'RAVEN brain online — deterministic knowledge engine (no provider configured)'
-            : 'Brain answered, but its knowledge layer reported nothing',
+          : keyRefused
+            ? 'RAVEN brain online — provider key was refused (401/403), so answers are local'
+            : knowledgeLive
+              ? 'RAVEN brain online — deterministic knowledge engine (no provider configured)'
+              : 'Brain answered, but its knowledge layer reported nothing',
         isCheckingHealth: false,
         health: data,
         healthCheckedAt: probedAt,
@@ -251,9 +257,17 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
       const cited = (result.citations ?? []).slice(0, 4).map((citation) =>
         citation.locator ? `${citation.label} · ${citation.locator}` : citation.label,
       )
-      const phases = (result.metadata?.trace ?? []).map(
-        (phase) => `${phase.phase}${phase.ms ? ` · ${phase.ms} ms` : ''}${phase.note ? ` — ${phase.note}` : ''}`,
-      )
+      // The trace is the server's own state machine, so the state name is printed with the
+      // phase that entered it — EXECUTING and VERIFYING become visible in the UI because the
+      // response said they happened, never because the client animated them. The state is
+      // named once per change so a seven-phase turn does not read as a stutter.
+      const rawTrace = result.trace ?? result.metadata?.trace ?? []
+      let lastState: string | null = null
+      const phases = rawTrace.map((phase) => {
+        const changed = phase.state !== lastState
+        lastState = phase.state
+        return `${changed ? `${phase.state} · ` : ''}${phase.phase}${phase.ms ? ` · ${phase.ms} ms` : ''}${phase.note ? ` — ${phase.note}` : ''}`
+      })
       sources = cited.length ? cited : undefined
       trace = phases.length ? phases : undefined
 

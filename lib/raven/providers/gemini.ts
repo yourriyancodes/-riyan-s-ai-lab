@@ -62,6 +62,9 @@ export function createGeminiProvider(options: GeminiOptions): ModelProvider {
             const found = models.some((name) => name === wanted || name.endsWith(`/${options.model}`))
             return {
               reachable: true,
+              // A model list the endpoint served *with our credential* is the definition of
+              // authorized; the detail below may still say the model itself is missing.
+              authorized: true,
               detail: models.length
                 ? found
                   ? `${models.length} model(s) listed; "${options.model}" available`
@@ -69,7 +72,13 @@ export function createGeminiProvider(options: GeminiOptions): ModelProvider {
                 : 'reachable, but the model list came back empty',
             }
           })()
-        : { reachable: false, detail: `${response.code}: ${response.message}` }
+        : {
+            // 401/403 is an endpoint that answered and refused *the credential*, not an
+            // endpoint that is down. Collapsing the two made "reachable" read as "usable".
+            reachable: response.code === 'auth',
+            authorized: response.code === 'auth' ? false : undefined,
+            detail: `${response.code}: ${response.message}`,
+          }
       probeCache = { at: Date.now(), value }
       return value
     },

@@ -15,9 +15,10 @@
  *    error code. A portfolio backend that 500s on a clever question is a broken demo.
  */
 import { ravenConfig, type RavenConfig } from './config'
-import { classifyIntent } from './intent'
+import { classifyIntent, resolveProjectReferent } from './intent'
 import { routeTurn, type RouterCapabilities } from './router'
 import { transition, WORKING_STATES } from './states'
+import { providerBreakerState, recordProviderFailure, recordProviderSuccess } from './breaker'
 import type {
   AgentStep,
   Citation,
@@ -70,21 +71,10 @@ export type BrainOptions = {
   skipPersistence?: boolean
 }
 
-/**
- * A tiny circuit breaker. After two consecutive provider failures this process stops
- * calling it for a minute and answers locally, because hammering a rate-limited key on
- * every message is slow and rude. The state is reported, never hidden.
- */
-const breaker = { failures: 0, openUntil: 0 }
-
-export function providerBreakerState(): { failures: number; open: boolean; openForMs: number } {
-  return { failures: breaker.failures, open: Date.now() < breaker.openUntil, openForMs: Math.max(0, breaker.openUntil - Date.now()) }
-}
-
-export function resetProviderBreaker(): void {
-  breaker.failures = 0
-  breaker.openUntil = 0
-}
+// The circuit breaker lives in `./breaker` so `system_status` can report it without importing
+// the brain that imports the tools. Re-exported here because the route and the suites have
+// always read these two names from this module.
+export { providerBreakerState, resetProviderBreaker } from './breaker'
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text)
 
@@ -116,13 +106,53 @@ class Tracker {
   }
 }
 
+/**
+ * The single place the "no model answered this" sentence is worded. Item 18 of the spec asks
+ * for an explicit statement when no provider exists, and three slightly different true
+ * sentences across three refusal paths would be worse than one — including for the reader of a
+ * log, who should be able to grep for it.
+ */
+/**
+ * A provider handle that will not dial out while the circuit breaker is open.
+ *
+ * Skipping the call is the entire point of the cooldown: an endpoint that has failed twice in a row
+ * is not going to answer faster on the third try, and every attempt is time spent in front of a
+ * trace the user is watching. The turn still reports a provider *failure* through the usual channel
+ * — with the reason and the remaining cooldown — so nothing about the skip is hidden and the
+ * difference between "the key is wrong", "the endpoint is down" and "we are waiting it out" stays
+ * visible in `degraded` and in the agent's step list. `probe` is passed through untouched: health may
+ * keep asking, because a cooldown exists to save the user's latency, not to avoid the truth.
+ */
+function heldByBreaker(provider: ModelProvider, open: ReturnType<typeof providerBreakerState>): ModelProvider {
+  return {
+    ...provider,
+    async generate() {
+      return {
+        ok: false,
+        provider: provider.id,
+        code: 'unavailable',
+        message: `not attempted: ${open.failures} consecutive failure(s), retrying after ${Math.ceil(open.openForMs / 1000)}s of cooldown`,
+        ms: 0,
+      }
+    },
+  }
+}
+
+function ungroundedNotice(config: RavenConfig): string {
+  const configured = Boolean(config.provider.id && config.provider.apiKeyPresent)
+  const why = configured
+    ? 'the configured provider did not answer this turn'
+    : 'no provider is configured, so nothing beyond this portfolio’s own records is available'
+  return `Offline/local reasoning is active — ${why}. Ask about the projects, skills, experiments, contact details, or how this backend works.`
+}
+
 export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions = {}): Promise<RavenResponse> {
   const config = options.config ?? ravenConfig()
   const tracker = new Tracker()
   const conversationId = input.conversationId
   const message0 = typeof input.message === 'string' ? input.message : ''
 
-  const registry = options.registry ?? createToolRegistry()
+  const registry = options.registry ?? createToolRegistry(undefined, { stepTimeoutMs: config.limits.agentStepTimeoutMs })
   const runs: ToolRun[] = []
   /** The registry records every run here; kept in sync after construction. */
   const auditRuns = (run: ToolRun) => runs.push(run)
@@ -291,12 +321,20 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     // itself; otherwise it takes a resolvable provider *and* a credential to be "there".
     const provider = options.providerOverride !== undefined ? options.providerOverride : resolveProvider(config)
     const providerAvailable = options.providerOverride !== undefined ? Boolean(options.providerOverride) : Boolean(provider) && config.provider.apiKeyPresent
+    const breaker = providerBreakerState()
     const capabilities: RouterCapabilities = {
       providerAvailable,
       knowledgeAvailable: true,
       databaseAvailable: Boolean(adapter && databaseMeta.reachable),
-      providerKnownFailing: providerBreakerState().open,
+      providerKnownFailing: breaker.open,
     }
+    // The router honours the breaker by refusing `genai`; the agentic path used to call the
+    // endpoint regardless, so a broken provider still cost the user a full timeout on every plan
+    // turn (measured: 1.5 s of retries per turn, 76 s when the endpoint hangs). While the breaker
+    // is open this turn hands out a handle that fails on contact instead of dialling out. It is
+    // deliberately not the same as "no provider configured": the failure travels through the normal
+    // channel with a measured reason, so the console reports a cooldown rather than a missing key.
+    const providerForTurn = provider && providerAvailable && breaker.open ? heldByBreaker(provider, breaker) : provider
 
     // ----------------------------------------------------- short-term memory
     const context = await loadContext({
@@ -310,7 +348,32 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
 
     // ---------------------------------------------------------------- intent
     tracker.enter('UNDERSTANDING', 'intent')
-    const intent = classifyIntent(message, input.visionContext ? { hint: 'vision context supplied' } : {})
+    const classifyOptions = input.visionContext ? { hint: 'vision context supplied' } : {}
+    let resolved = classifyIntent(message, classifyOptions)
+
+    // A follow-up carries its subject in the *previous answer*, not in itself. "Which one uses
+    // RAG?" after a project listing is a precise question, and answering it as an isolated
+    // query — which a one-string classifier is right to do — wastes a turn the user
+    // experiences as continuous. Resolution is attempted only when the message on its own
+    // would have been refused anyway, so it can never overwrite a question that already has an
+    // intent, and it can only name something the previous answer actually said.
+    let retrievalText = message
+    if (context.recent.length && (resolved.intent === 'unknown' || resolved.confidence < 0.35)) {
+      const referent = resolveProjectReferent(message, context.recent)
+      if (referent) {
+        const withContext = classifyIntent(`${message} ${referent.name}`, classifyOptions)
+        if (withContext.intent !== 'unknown') {
+          resolved = {
+            ...withContext,
+            entities: { ...withContext.entities, project: referent.name },
+            signals: [...withContext.signals, `anaphora:${referent.how}`],
+          }
+          retrievalText = `${message} ${referent.name}`
+          tracker.push('anaphora', undefined, referent.note)
+        }
+      }
+    }
+    const intent = resolved
 
     // The composer may only use names this repository actually documents; verification
     // checks the finished text against this vocabulary.
@@ -377,7 +440,9 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     }
 
     tracker.enter(route.mode === 'agentic' ? 'REASONING' : 'RESEARCHING', 'retrieval', `intent ${intent.intent}, ${registry.names().length} tools available`)
-    const plan = planRetrieval({ intent, message })
+    // The retrieval query may carry the resolved subject; the reply and the stored transcript
+    // keep the user's own words, so nothing is attributed to them that they did not type.
+    const plan = planRetrieval({ intent, message: retrievalText })
     const retrieval = await runRetrieval(registry, plan, toolContext, auditRuns)
     for (const [index, call] of retrieval.calls.entries()) {
       const outcome = retrieval.outcomes.get(call.tool)
@@ -404,6 +469,21 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       })
       memoryResult = { stored: actions.stored, expired: actions.expired, errors: actions.errors, actions: actions.actions }
       navigation = actions.navigation
+      // The transition above records that work was attempted; this records what came of it.
+      // `EXECUTING` in the UI is then always followed by counts a reader can check, which is
+      // the difference between a state machine and a status light — and a proposal awaiting
+      // approval is counted separately, because nothing ran for it.
+      {
+        const succeeded = actions.runs.filter((run) => run.status === 'succeeded').length
+        const failed = actions.runs.filter((run) => run.status === 'failed').length
+        const proposed = actions.actions.filter((action) => action.status === 'proposed').length
+        const parts = [`${succeeded}/${actions.runs.length} run(s) succeeded`]
+        if (failed) parts.push(`${failed} failed`)
+        if (proposed) parts.push(`${proposed} awaiting approval`)
+        if (actions.stored) parts.push(`${actions.stored} stored`)
+        if (actions.expired) parts.push(`${actions.expired} expired`)
+        tracker.push('actions-outcome', undefined, parts.join(', '))
+      }
       for (const action of actions.actions) {
         stepRecords.push({
           action: `action ${action.tool} → ${action.status}`,
@@ -417,6 +497,8 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
 
     // ---------------------------------------------------------------- answer
     let answer: string | null = null
+    /** Set when a layer explained *why* it had nothing, so the refusal can be specific. */
+    let ungroundedExplanation: string | null = null
     let citations: Citation[] = [...retrieval.citations]
     let providerMeta: { id: string; label: string; model: string } | null = null
     let mode: RavenMode = route.mode
@@ -430,38 +512,67 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         : null
 
     if (route.mode === 'agentic') {
-      const agentic = await runAgenticTurn({
-        message,
-        intent,
-        retrieval,
-        registry,
-        context: toolContext,
-        config,
-        provider: capabilities.providerAvailable ? provider : null,
-        memories: context.memories,
-        recent: context.recent,
-        onRun: auditRuns,
-      })
-      answer = agentic.answer
-      citations = agentic.citations
-      providerMeta = agentic.provider
-      toolsUsed = [...new Set([...toolsUsed, ...agentic.toolsUsed])]
-      stepRecords.push(...agentic.steps)
-      if (agentic.synthesizedBy === 'deterministic') {
-        degradedFrom = 'genai'
-        degradedBecause = agentic.providerFailure ? `provider ${agentic.providerFailure.code}; synthesized from the same evidence locally` : 'no provider configured; synthesized from the same evidence locally'
-      }
-      if (agentic.providerFailure) {
-        breaker.failures++
-        if (breaker.failures >= 2) breaker.openUntil = Date.now() + 60_000
-      } else if (agentic.synthesizedBy === 'provider') {
-        breaker.failures = 0
+      // `RAVEN_AGENT_TURN_TIMEOUT_MS` is enforced here rather than inside the agent, because the
+      // thing it protects against is the whole turn: a slow provider call is not a slow tool step,
+      // and a loop that stops checking the clock after the first step is not a budget. Abandoning
+      // the race is deliberate — the runs already recorded still land in the audit, and the
+      // turn answers from retrieval with the overrun named in `degraded`.
+      const budgetMs = config.limits.agentTurnTimeoutMs
+      const raced = await Promise.race([
+        runAgenticTurn({
+          message,
+          intent,
+          retrieval,
+          registry,
+          context: toolContext,
+          config,
+          provider: capabilities.providerAvailable ? providerForTurn : null,
+          memories: context.memories,
+          recent: context.recent,
+          onRun: auditRuns,
+        })
+          .then(
+            (agentic) => ({ kind: 'ok' as const, agentic }),
+            (error) => ({ kind: 'error' as const, error: error as Error }),
+          ),
+        new Promise<{ kind: 'over' }>((resolve) => {
+          const timer = setTimeout(() => resolve({ kind: 'over' }), budgetMs)
+          ;(timer as { unref?: () => void }).unref?.()
+        }),
+      ])
+      if (raced.kind !== 'ok') {
+        tracker.push('agent', undefined, raced.kind === 'over' ? `turn budget of ${budgetMs} ms exceeded; answered from retrieval` : `agentic path failed: ${clip(raced.error.message, 160)}`)
+        degradedFrom = 'agentic'
+        degradedBecause = raced.kind === 'over' ? `the ${budgetMs} ms turn budget ran out before the agent finished; answered from what retrieval had already returned` : raced.error.message
+        const local = composeKnowledgeAnswer({ message, intent, retrieval })
+        // Same rule as everywhere else in this file: a corpus answer that says "nothing here
+        // answers that" is a refusal, not an answer, and the specific sentence becomes the refusal.
+        if (local?.ungrounded) ungroundedExplanation = local.answer
+        answer = local?.ungrounded ? null : local?.answer ?? null
+        citations = local?.citations ?? citations
+        // The mode reports what answered, not what was planned: this turn delivered a knowledge
+        // composition under an agentic plan, and `degraded` is what says so.
+        if (raced.kind === 'over') mode = answer ? 'knowledge' : 'offline'
+        stepRecords.push({ action: 'agent turn', status: raced.kind === 'over' ? 'timeout' : 'failed', ms: budgetMs, note: degradedBecause })
+      } else {
+        const agentic = raced.agentic
+        answer = agentic.answer
+        citations = agentic.citations
+        providerMeta = agentic.provider
+        toolsUsed = [...new Set([...toolsUsed, ...agentic.toolsUsed])]
+        stepRecords.push(...agentic.steps)
+        if (agentic.synthesizedBy === 'deterministic') {
+          degradedFrom = 'genai'
+          degradedBecause = agentic.providerFailure ? `provider ${agentic.providerFailure.code}; synthesized from the same evidence locally` : 'no provider configured; synthesized from the same evidence locally'
+        }
+        if (agentic.providerFailure) recordProviderFailure()
+        else if (agentic.synthesizedBy === 'provider') recordProviderSuccess()
       }
     } else if (route.mode === 'genai') {
       tracker.enter('THINKING', 'provider-synthesis', provider ? `${provider.id}` : 'no provider resolved')
       const evidence = evidenceFromRetrieval(retrieval, message)
       const synthesis = await synthesizeWithProvider({
-        provider: provider ?? null,
+        provider: providerForTurn ?? null,
         config,
         question: message,
         evidence,
@@ -476,16 +587,18 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         answer = cleanReply(result.text)
         providerMeta = { id: result.provider, label: provider?.label ?? result.provider, model: result.model }
         citations.push({ kind: 'provider', source: `provider:${result.provider}/${result.model}`, label: 'Model answer, grounded in the retrieved portfolio records', quote: clip(answer ?? '', 300) })
-        breaker.failures = 0
+        recordProviderSuccess()
         stepRecords.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms, note: `${result.provider}/${result.model}${synthesis ? `, prompt ${synthesis.promptChars} chars` : ''}` })
       } else {
         const code = result && !result.ok ? result.code : 'no_provider'
         const detail = result && !result.ok ? result.message : 'no provider resolved for this process'
-        breaker.failures++
-        if (breaker.failures >= 2) breaker.openUntil = Date.now() + 60_000
+        recordProviderFailure()
         stepRecords.push({ action: 'synthesize with provider', status: 'failed', ms: result?.ms ?? 0, note: `${code}: ${clip(detail, 140)}` })
         const local = composeKnowledgeAnswer({ message, intent, retrieval, ...(memoryForAnswer ? { memory: memoryForAnswer } : {}), ...(navigation ? { navigation } : {}) })
-        answer = local?.answer ?? null
+        // A local fallback that also found nothing must not be presented as a knowledge
+        // answer: the refusal below carries the specific sentence instead.
+        if (local?.ungrounded) ungroundedExplanation = local.answer
+        answer = local?.ungrounded ? null : local?.answer ?? null
         citations = local?.citations ?? citations
         mode = answer ? 'knowledge' : 'offline'
         degradedFrom = 'genai'
@@ -493,8 +606,20 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       }
     } else {
       const local = composeKnowledgeAnswer({ message, intent, retrieval, ...(memoryForAnswer ? { memory: memoryForAnswer } : {}), ...(navigation ? { navigation } : {}) })
-      answer = local?.answer ?? null
+      // The composer can answer with an explanation of why it cannot answer. Taking that as a
+      // `knowledge` reply was the semantic wart: the mode promised retrieved knowledge while
+      // `verified` said false and no citation stood behind a word of it. `answer` goes null so
+      // the offline path below owns the status, the state and the empty citation set, and the
+      // specific sentence survives as the refusal's own opening instead of a generic one.
+      if (local?.ungrounded) ungroundedExplanation = local.answer
+      answer = local?.ungrounded ? null : local?.answer ?? null
       citations = local?.citations ?? citations
+      if (local?.ungrounded) {
+        // The router asked for knowledge; the layer returned "nothing grounded". Saying so in
+        // `degraded` is what lets a log or a UI explain the turn without re-deriving it.
+        degradedFrom = route.mode
+        degradedBecause = 'the composer found nothing grounded to say'
+      }
       if (local?.note) stepRecords.push({ action: 'compose', status: 'succeeded', ms: 0, note: local.note })
     }
 
@@ -526,7 +651,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       return respond({
         ...base,
         success: false,
-        response: `I could not ground an answer for that in this portfolio's data, and I do not invent one. ${retrieval.errors.length ? `Retrieval reported: ${retrieval.errors.map((error) => `${error.tool} ${error.status}`).join('; ')}. ` : ''}Ask about the projects, skills, experiments, contact details, or how this backend works — or configure a provider for open-ended questions.`,
+        response: `${ungroundedExplanation ?? `I could not ground an answer for that in this portfolio's data, and I do not invent one.`} ${retrieval.errors.length ? `Retrieval reported: ${retrieval.errors.map((error) => `${error.tool} ${error.status}`).join('; ')}. ` : ''}${ungroundedNotice(config)}`,
         mode: 'offline',
         state: 'OFFLINE',
         // A refusal cites nothing. These are the records retrieval returned and the composer
@@ -543,7 +668,12 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
           ...route,
           mode: 'offline',
           usedProvider: false,
-          ...(route.mode === 'offline' ? {} : { degradedFrom: route.mode, degradedBecause: 'no evidence cleared the relevance floor' }),
+          // Prefer the reason this turn actually generated — a provider that failed and a
+          // retrieval that cleared no relevance floor are different facts, and the generic
+          // sentence erased the difference for every genai failure that ended in a refusal.
+          ...(route.mode === 'offline'
+            ? {}
+            : { degradedFrom: degradedFrom ?? route.mode, degradedBecause: degradedBecause ?? 'no evidence cleared the relevance floor' }),
         },
         provider: providerMeta,
         memory: { retrieved: context.memories.length + context.recent.length, stored: memoryResult.stored },
@@ -559,7 +689,14 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     }
 
     // ------------------------------------------------------------ verification
-    tracker.enter('VERIFYING', 'verification', `${runs.length} tool run(s) to check against`)
+    // A turn with no tool run and no citation has nothing for the verifier to contradict, so
+    // it is recorded as a phase rather than as the VERIFYING state: the state belongs to the
+    // UI, and showing "verifying" over a pleasantry teaches the reader to ignore it.
+    if (runs.length || citations.length) {
+      tracker.enter('VERIFYING', 'verification', `${runs.length} tool run(s) to check against`)
+    } else {
+      tracker.push('verification', undefined, 'nothing retrieved and nothing claimed, so only the answer-presence rules apply')
+    }
     const evidenceText = [
       ...retrieval.citations.map((citation) => citation.quote ?? ''),
       ...[...retrieval.outcomes.values()].map((outcome) => JSON.stringify(outcome.output ?? '').slice(0, 4000)),

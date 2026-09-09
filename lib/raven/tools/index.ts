@@ -10,6 +10,7 @@
 import { focusAreas, glossary, skillNodes } from '@/data/ravenKnowledge'
 import { ToolRegistry, type ToolHandler } from './registry'
 import { describeCapabilities } from '../config'
+import { providerBreakerState } from '../breaker'
 import { peekDatabaseHandle } from '../db'
 import {
   contact,
@@ -362,6 +363,7 @@ const handlers: Record<string, ToolHandler> = {
 
   system_status: (_input, context) => {
     const capabilities = describeCapabilities(context.config)
+    const breaker = providerBreakerState()
     const handle = peekDatabaseHandle()
     const stats = corpusStats()
     return {
@@ -371,6 +373,11 @@ const handlers: Record<string, ToolHandler> = {
           id: capabilities.providerId,
           label: capabilities.providerLabel,
           model: capabilities.providerModel,
+          // Reachability and authorization are measured by `GET /api/health`, which is the
+          // route allowed to spend a probe. This tool never touches the network — so what it
+          // reports is what *this process* observed: whether the endpoint has been refusing.
+          failing: breaker.open,
+          consecutiveFailures: breaker.failures,
         },
         database: handle
           ? { driver: handle.driver, reachable: handle.adapter.status().reachable, detail: handle.adapter.status().detail, degradedFrom: handle.notes }
@@ -485,9 +492,13 @@ const handlers: Record<string, ToolHandler> = {
   },
 }
 
-export function createToolRegistry(onRun?: (run: import('../types').ToolRun) => void): ToolRegistry {
+export function createToolRegistry(onRun?: (run: import('../types').ToolRun) => void, limits?: { stepTimeoutMs?: number }): ToolRegistry {
   const registry = new ToolRegistry({
-    defaults: { timeoutMs: 3000, maxOutputChars: 12_000 },
+    // `limits.stepTimeoutMs` is `RAVEN_AGENT_STEP_TIMEOUT_MS`, read from the config by the caller.
+    // It arrives as a ceiling rather than a default because every tool here already declares its
+    // own number: an env var that only applied to tools too lazy to choose one would be a knob that
+    // looks configurable and is not.
+    defaults: { timeoutMs: limits?.stepTimeoutMs ?? 3000, maxOutputChars: 12_000, ...(limits?.stepTimeoutMs ? { maxTimeoutMs: limits.stepTimeoutMs } : {}) },
     limits: { maxStringChars: 400 },
     ...(onRun ? { onRun } : {}),
   })

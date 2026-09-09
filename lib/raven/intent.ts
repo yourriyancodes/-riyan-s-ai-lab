@@ -205,6 +205,149 @@ function extractSection(text: string): SectionReference | null {
   return null
 }
 
+/* ------------------------------------------------------------------ *
+ * Follow-up resolution
+ *
+ * "Which one uses RAG?" is not an independent question. Answering it
+ * requires the answer that came immediately before, and treating the
+ * message as if it stood alone — which the classifier, being a pure
+ * function of one string, correctly does — throws that away and produces
+ * a refusal on a page that has the data. So resolution happens here, in
+ * one deterministic step, before the router ever sees the turn.
+ *
+ * Three rules keep it from becoming a hallucination generator:
+ *   • it only runs on *short referential* messages, never on a question
+ *     that carries its own subject;
+ *   • a referent must have been actually mentioned in the previous
+ *     answer — nothing is invented from the corpus at large;
+ *   • it resolves to at most one project, by the user's own words first,
+ *     an ordinal second, and token overlap last, and abstains when the
+ *     evidence is ambiguous.
+ * ------------------------------------------------------------------ */
+
+export type RecentTurn = { role: string; content: string }
+export type ResolvedReferent = { name: string; how: 'term' | 'ordinal' | 'overlap'; note: string }
+
+const ORDINAL_INDEX: Record<string, number> = { first: 0, second: 1, third: 2, fourth: 3, fifth: 4, sixth: 5, seventh: 6, eighth: 7 }
+const REFERENTIAL = /\b(which one|which ones|which of them|which of those|the (?:first|second|third|fourth|fifth|last|latter|former)(?: one)?|that one|this one|those (?:two|three)?|it|its|they|them)\b/
+/** How far back a follow-up may reach. Bounded, like everything else here. */
+const LOOKBACK = 3
+/**
+ * An ordinal ("the second one") is a pointer into a *list*, so the reach for it is measured in
+ * answers rather than rows, and stops at the first answer that named two or more projects. Bounded,
+ * because a four-turn-old list is not what a person means by "the second one".
+ */
+const ORDINAL_LOOKBACK = 5
+
+/** How many distinct projects an answer named, in the order it named them. */
+function mentions(text: string): { name: string; at: number }[] {
+  const haystack = normalize(text)
+  return projects
+    .map((project) => ({ name: project.name, at: haystack.indexOf(normalize(project.name)) }))
+    .filter((entry) => entry.at >= 0)
+    .sort((a, b) => a.at - b.at)
+}
+
+export function resolveProjectReferent(text: string, recent: readonly RecentTurn[]): ResolvedReferent | null {
+  const clean = normalize(text)
+  if (!clean) return null
+  const words = clean.split(' ')
+  // A message with a subject of its own is not a follow-up, however many "it"s it contains.
+  if (words.length > 14 || !REFERENTIAL.test(clean)) return null
+  // The window is counted in things RAVEN *said*, not in table rows: an intervening question and
+  // its one-line acknowledgement would otherwise spend two of three slots and put the listing the
+  // user is pointing at out of reach (measured across a restart: "And what about the first one?"
+  // resolved to the previous answer's single project instead of the listing two turns earlier).
+  // `recent` arrives oldest-first from every adapter, so the tail of the array is the recent part.
+  const said = recent.filter((turn) => turn.role === 'raven' && turn.content).reverse() // newest first
+  if (!said.length) return null
+  const ordinal = /\bthe (first|second|third|fourth|fifth|sixth|seventh|eighth)\b|\bthe last\b/.exec(clean)
+  // An ordinal can only point at a *list*, so for those the search is for the most recent answer
+  // that actually listed two or more projects — up to ORDINAL_LOOKBACK answers back, and no
+  // further. If nothing in that reach was a list, the phrase has no referent here and the turn is
+  // abstained on rather than matched to whatever project happens to be in the corpus first.
+  const listing = ordinal
+    ? said
+        .slice(0, ORDINAL_LOOKBACK)
+        .map((turn) => ({ turn, named: mentions(turn.content).length }))
+        .find((entry) => entry.named >= 2)
+    : null
+  const priorSource = ordinal ? (listing?.turn.content ?? '') : said.slice(0, LOOKBACK).map((turn) => turn.content).join(' ')
+  const prior = normalize(priorSource)
+  if (!prior) return null
+
+  // Only projects that answer actually named are candidates, ordered by where it said them and not
+  // by corpus order: "the first one" means first *in the answer RAVEN just gave*, and taking the
+  // corpus's first project instead would be a different sentence wearing the same words.
+  // Names are compared normalized, because a reply stores "RAG Knowledge Assistant" and a
+  // lowercased needle would never find it otherwise.
+  const mentioned = projects
+    .map((project) => ({ project, at: prior.indexOf(normalize(project.name)) }))
+    .filter((entry) => entry.at >= 0)
+    .sort((a, b) => a.at - b.at)
+    .map((entry) => entry.project)
+  if (!mentioned.length) return null
+
+  // Positional reference, resolved against the listing it pointed at.
+  if (ordinal?.[1]) {
+    const chosen = mentioned[ORDINAL_INDEX[ordinal[1]]]
+    if (chosen)
+      return {
+        name: chosen.name,
+        how: 'ordinal',
+        note: `“${clean}” resolved to “${chosen.name}” (position ${ORDINAL_INDEX[ordinal[1]] + 1} of that ${mentioned.length}-item list)`,
+      }
+    // Named fewer items than the ordinal asks for: "the fourth one" after a list of two is not a
+    // question about this corpus, and guessing the third project would be a fabrication.
+    return null
+  }
+  if (/\bthe last\b/.test(clean)) {
+    const chosen = mentioned[mentioned.length - 1]!
+    return { name: chosen.name, how: 'ordinal', note: `“${clean}” resolved to the last project in that answer (“${chosen.name}”)` }
+  }
+
+  const terms = tokenize(text)
+  const asKey = (value: string) => tokenize(value)
+  const named = mentioned.find((project) =>
+    terms.some((term) => asKey(project.name).includes(term) || asKey(project.technology ?? '').includes(term) || asKey(project.description ?? '').includes(term)),
+  )
+  if (named) return { name: named.name, how: 'term', note: `“${clean}” resolved to “${named.name}” by the words in the question` }
+
+  // Last resort: score the candidates by overlap with the question, and only accept a single
+  // clear winner. Two candidates on the same score is a coin flip, and a coin flip is not a
+  // resolution — better to leave the turn as an honest `unknown`.
+  const scored = mentioned
+    .map((project) => ({ project, hits: terms.filter((term) => asKey(`${project.name} ${project.description ?? ''} ${project.technology ?? ''}`).includes(term)).length }))
+    .sort((a, b) => b.hits - a.hits)
+  if (scored[0] && scored[0].hits > 0 && (scored[1]?.hits ?? 0) < scored[0].hits) {
+    return { name: scored[0].project.name, how: 'overlap', note: `“${clean}” resolved to “${scored[0].project.name}” as the only candidate the question’s words matched` }
+  }
+  return null
+}
+
+/**
+ * An exclusion phrase — "something outside the portfolio", "anything not in your records" — asks
+ * about the *edge* of this knowledge base, not for the list in the middle of it. Every rule below
+ * scores vocabulary, and `portfolio` is in PROJECT_QUERY, so without this guard an honest "I have
+ * no record of that" was displaced by a confident project listing (live: "Tell me something outside
+ * the portfolio knowledge base." → five projects). Portfolio-shaped intents are dropped here so the
+ * turn falls through to `unknown` and is treated the way any unmatched question deserves: retrieval,
+ * then a refusal if nothing in this corpus answers it.
+ */
+const OUTSIDE_SCOPE_REQUEST =
+  /\b(outside|beyond|not\s+(?:in|from|on)|other\s+than|besides|excluding)\s+(?:the\s+|your\s+|this\s+)?(?:\w+\s+){0,2}?(portfolio|knowledge\s*base|knowledge|site|corpus|records?|scope|docs?|documentation)\b/i
+
+/**
+ * A request about work that does not exist yet — "suggest a CLI architecture for my next project" —
+ * is not a question about the records, and answering it with a project listing is a non-sequitur
+ * wearing a citation. These are demoted to `unknown` so a configured provider reasons about them
+ * (clearly labelled as provider synthesis) and, when none is configured, the turn is refused.
+ */
+const HYPOTHETICAL_REQUEST =
+  /\b(my next|next project|new project|project idea|architecture for|ideas for (?:a|my|the)|what should i build|suggest a|suggest some|recommend a|help me (?:build|plan|design))\b/i
+
+const PORTFOLIO_SHAPED_INTENTS: RavenIntent[] = ['portfolio.projects', 'portfolio.project', 'portfolio.skills', 'portfolio.experiments', 'portfolio.sections']
+
 export function classifyIntent(message: string, options: ClassifyOptions = {}): IntentMatch {
   const text = message.replace(/\s+/g, ' ').trim()
   const lower = text.toLowerCase()
@@ -259,6 +402,20 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
 
   if (options.hint) add('portfolio.sections', 0.5, ['caller-hint'])
 
+  // Two phrases mark a question the records cannot answer. The portfolio-shaped intents they would
+  // otherwise have triggered are removed here, and the *reason* travels with the turn: the composer
+  // refuses instead of listing near-misses, and the trace shows a suppression rather than a silent
+  // no-match. Each entry is `reason:intent`, so nothing about the decision is hidden from the log.
+  const suppressed: string[] = []
+  for (const [reason, matcher] of [
+    ['outside-scope', OUTSIDE_SCOPE_REQUEST],
+    ['hypothetical', HYPOTHETICAL_REQUEST],
+  ] as const) {
+    if (!matcher.test(lower)) continue
+    for (const intent of PORTFOLIO_SHAPED_INTENTS) if (scores.delete(intent)) suppressed.push(`${reason}:${intent}`)
+  }
+  const suppressionReasons = [...new Set(suppressed.map((entry) => entry.slice(0, entry.indexOf(':'))))]
+
   // Nothing matched. `smalltalk` is a claim about the *words*, not about their count: the
   // previous test here was `contentTokens <= 2`, which silently turned every short question
   // ("access computer", "phone number", "your price") into a pleasantry and answered it with
@@ -279,8 +436,14 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
     return {
       intent: pleasantry ? 'smalltalk' : 'unknown',
       confidence: pleasantry ? 0.5 : 0.05,
-      signals: contentTokens ? [`tokens:${contentTokens}`] : ['empty'],
-      entities: { ...(contentTokens ? { tokens: contentTokens } : {}), ...(section ? { section: section.id } : {}) },
+      // A suppression is itself a measurement: "I dropped a portfolio intent because you asked for
+      // something the records cannot answer" belongs in the trace, not silently inside the classifier.
+      signals: [...(suppressed.length ? [`suppress:${suppressed.join(',')}`] : []), ...(contentTokens ? [`tokens:${contentTokens}`] : ['empty'])],
+      entities: {
+        ...(contentTokens ? { tokens: contentTokens } : {}),
+        ...(section ? { section: section.id } : {}),
+        ...(suppressionReasons.length ? { unanswerableByCorpus: suppressionReasons.join('+') } : {}),
+      },
     }
   }
 
@@ -300,7 +463,7 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
   return {
     intent,
     confidence: Number(confidence.toFixed(3)),
-    signals: [...winning.signals],
-    entities,
+    signals: [...winning.signals, ...(suppressed.length ? [`suppress:${suppressed.join(',')}`] : [])],
+    entities: suppressed.length ? { ...entities, unanswerableByCorpus: suppressionReasons.join('+') } : entities,
   }
 }

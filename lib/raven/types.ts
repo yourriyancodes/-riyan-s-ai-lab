@@ -311,8 +311,16 @@ export type ProviderResult =
 export type ModelProvider = {
   id: string
   label: string
-  /** Cheap reachability probe used by /api/health. May be a no-op for offline stubs. */
-  probe(): Promise<{ reachable: boolean; detail: string }>
+  /**
+   * Cheap reachability probe used by /api/health. May be a no-op for offline stubs.
+   *
+   * `reachable` means "the endpoint answered HTTP"; `authorized` means "it answered *us*".
+   * They are separate because a wrong key produces a reachable endpoint that refuses to
+   * serve anything, and reporting that as merely reachable invites the reader to conclude
+   * the model is live. `undefined` means the probe could not tell (the connection failed
+   * before any credential was examined).
+   */
+  probe(): Promise<{ reachable: boolean; detail: string; authorized?: boolean }>
   generate(request: ProviderRequest): Promise<ProviderResult>
 }
 
@@ -406,6 +414,16 @@ export interface DatabaseAdapter {
   ensureSchema(): Promise<void>
   upsertConversation(conversation: ConversationRecord): Promise<void>
   appendMessage(message: ConversationMessageRecord): Promise<void>
+  /**
+   * The last `limit` messages of a conversation, **oldest first**.
+   *
+   * Every adapter reaches that shape deliberately — SQL queries `created_at DESC, id DESC LIMIT n`
+   * and reverses the rows, the in-memory store keeps insertion order and takes the tail — because
+   * two consumers read it positionally and would misread the opposite convention without noticing:
+   * the prompt builder walks backwards to spend the context budget on the newest turns, and the
+   * referent resolver looks at the *tail* for what RAVEN just said. A silent reversal would not
+   * crash anything; it would answer follow-up questions from four turns ago.
+   */
   recentMessages(conversationId: string, limit: number): Promise<ConversationMessageRecord[]>
   listConversations(sessionId: string, limit: number): Promise<ConversationRecord[]>
   remember(memory: MemoryRecord): Promise<void>

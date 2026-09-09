@@ -170,6 +170,35 @@ await check('probe reports reachability for /api/health', async () => {
   assert.match(probed.detail, /available/)
 })
 
+await check('a probe separates "the endpoint answered" from "the endpoint accepts this key"', async () => {
+  clearGeminiProbeCache()
+  script = [{ status: 200, json: { models: [{ name: 'models/gemini-2.5-flash' }] } }]
+  const accepted = await gemini().probe()
+  assert.equal(accepted.reachable, true)
+  assert.equal(accepted.authorized, true, 'a served model list is authorization, and the probe must say so')
+
+  clearGeminiProbeCache()
+  script = [{ status: 401, json: { error: { message: 'API key not valid' } } }]
+  const refused = await gemini().probe()
+  assert.equal(refused.reachable, true, 'a 401 is an endpoint that answered; calling it unreachable hides the real problem')
+  assert.equal(refused.authorized, false, 'the credential was rejected and the probe must not leave that ambiguous')
+  assert.match(refused.detail, /401|auth/i)
+
+  clearGeminiProbeCache()
+  script = [{ status: 403, json: { error: { message: 'Permission denied on key' } } }]
+  const forbidden = await gemini().probe()
+  assert.equal(forbidden.reachable, true)
+  assert.equal(forbidden.authorized, false, '403 is a credential problem too')
+
+  // A 5xx says nothing about the key, so `authorized` must stay unknown rather than default
+  // to false — a reader who sees "not authorized" will go looking for a bad key.
+  clearGeminiProbeCache()
+  script = [{ status: 503, json: { error: { message: 'backend busy' } } }]
+  const broken = await gemini().probe()
+  assert.equal(broken.reachable, false)
+  assert.equal(broken.authorized, undefined, 'an outage is not a credential judgement')
+})
+
 // ---------------------------------------------------------------------------
 group('2. OpenAI-compatible provider (the local, zero-cost path)')
 
@@ -383,6 +412,24 @@ await check('invalid JSON, missing message and empty message are all rejected', 
   assert.equal(data.state, 'OFFLINE')
 })
 
+await check('no refusal in the suite leaks a stack frame or an internal path', async () => {
+  resetRateLimiter()
+  const cases = [
+    ['malformed', '{oops'],
+    ['empty', JSON.stringify({ message: '   ' })],
+    ['oversized', JSON.stringify({ message: 'x'.repeat(9000) })],
+  ]
+  for (const [label, raw] of cases) {
+    const response = await ravenRoute.POST(new Request('http://localhost/api/raven', { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw }))
+    const text = await response.text()
+    assert.ok(response.status >= 400, `${label} was not refused`)
+    assert.ok(!/\n\s+at \S/.test(text), `${label} leaked a stack frame`)
+    assert.ok(!/(\/home\/|\/app\/|node_modules|\.ts:\d+)/.test(text), `${label} leaked a filesystem path`)
+    assert.ok(!/RAVEN_API_KEY|Bearer /i.test(text), `${label} leaked credential material`)
+    JSON.parse(text) // the refusal is still valid JSON, not a page
+  }
+})
+
 await check('a rejection carries the canonical fields and invents nothing', async () => {
   resetRateLimiter()
   const rejected = await ravenRoute.POST(post({ notMessage: 'typo in the client' }, { headers: { 'x-forwarded-for': '203.0.113.44' } }))
@@ -441,6 +488,32 @@ await check('GET /api/health reports measured capability, never a fake flag', as
   assert.ok(data.tools.some((tool) => tool.name === 'search_knowledge' && tool.permission === 'read'))
   assert.ok(data.tools.some((tool) => tool.name === 'remember_fact' && tool.permission === 'action'))
   assert.ok(data.states.includes('THINKING') && data.states.includes('VISION'))
+})
+
+await check('health reports configured, reachable and authorized as three facts', async () => {
+  const previous = { ...process.env }
+  try {
+    process.env.RAVEN_API_KEY = 'AUTH-CHECK-4f7b'
+    process.env.RAVEN_PROVIDER = 'gemini'
+    process.env.RAVEN_MODEL = 'gemini-2.5-flash'
+    process.env.RAVEN_BASE_URL = base
+    process.env.RAVEN_DB_DRIVER = 'memory'
+    clearGeminiProbeCache()
+    script = [{ status: 401, json: { error: { message: 'API key not valid' } } }]
+    const response = await healthRoute.GET(new Request('http://localhost/api/health'))
+    const data = await response.json()
+    assert.equal(data.providerConfigured, true, 'a key is present, whatever the endpoint thinks of it')
+    assert.equal(data.providerReachable, true, 'the endpoint answered HTTP; that is reachability')
+    assert.equal(data.providerAuthorized, false, 'and it refused the credential; that is authorization')
+    assert.notEqual(data.status, 'READY', 'a rejected key must never make the deployment look live')
+    assert.match(data.note, /refused|401|credential/i, `the note should explain the rejection, saw: ${data.note}`)
+    const text = JSON.stringify(data)
+    assert.ok(!text.includes('AUTH-CHECK-4f7b'), 'the key was echoed by /api/health')
+    assert.ok(!/\n\s+at |node:internal|\.mjs?:\d+:\d+/.test(text), 'a stack frame reached the response body')
+  } finally {
+    process.env = previous
+    clearGeminiProbeCache()
+  }
 })
 
 await check('a configured key is never echoed by health or the brain', async () => {
@@ -503,6 +576,42 @@ await check('JSON extraction survives fences and prose wrappers', () => {
   assert.deepEqual(extractJsonObject('Sure! {"answer":"hi"} hope that helps'), { answer: 'hi' })
   assert.equal(extractJsonObject('no json here'), null)
   assert.equal(cleanReply('RAVEN: hello\n'), 'hello')
+})
+
+await check('a timeout costs one attempt; a 5xx may use the retry budget', async () => {
+  // A hang is not the same as a 500. The endpoint already failed to answer inside the time we
+  // gave it, so trying again multiplies the wait the user is watching (live: 3 × RAVEN_TIMEOUT_MS
+  // ≈ 76 s for one turn) without changing the odds. A 5xx arrives quickly and is often transient,
+  // so retries stay useful there.
+  const { requestJson } = await import(`${ROOT}/lib/raven/providers/http.ts`)
+  const original = globalThis.fetch
+  let calls = 0
+  try {
+    globalThis.fetch = (_url, init) => {
+      calls++
+      return new Promise((_, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          const error = new Error('aborted')
+          error.name = 'AbortError'
+          reject(error)
+        })
+      })
+    }
+    const hung = await requestJson({ url: 'http://127.0.0.1:9/chat', method: 'POST', body: {}, timeoutMs: 40, retries: 2, sleep: async () => {} })
+    assert.equal(hung.ok, false)
+    assert.equal(hung.code, 'timeout', 'a never-settling request has to be reported as the timeout it is')
+    assert.equal(calls, 1, `a timeout was retried ${calls} times: the wait must stay bounded by one timeoutMs`)
+    calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      return new Response(JSON.stringify({ error: { message: 'upstream exploded' } }), { status: 500, headers: { 'content-type': 'application/json' } })
+    }
+    const unavailable = await requestJson({ url: 'http://127.0.0.1:9/chat', method: 'POST', body: {}, timeoutMs: 500, retries: 2, sleep: async () => {} })
+    assert.equal(unavailable.code, 'unavailable')
+    assert.equal(calls, 3, 'a fast 500 should spend the retry budget it was given')
+  } finally {
+    globalThis.fetch = original
+  }
 })
 
 // ---------------------------------------------------------------------------

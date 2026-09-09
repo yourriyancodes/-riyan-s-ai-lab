@@ -58,6 +58,9 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
             const found = ids.some((id) => id === options.model || id.startsWith(`${options.model}:`))
             return {
               reachable: true,
+              // A model list the endpoint served *with our credential* is the definition of
+              // authorized; the detail below may still say the model itself is missing.
+              authorized: true,
               detail: ids.length
                 ? found
                   ? `${ids.length} model(s) served; "${options.model}" available`
@@ -65,7 +68,11 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
                 : 'endpoint answered, but listed no models',
             }
           })()
-        : { reachable: false, detail: `${response.code}: ${response.message}` }
+        : {
+            reachable: response.code === 'auth',
+            authorized: response.code === 'auth' ? false : undefined,
+            detail: `${response.code}: ${response.message}`,
+          }
       probeCache = { at: Date.now(), value }
       return value
     },
