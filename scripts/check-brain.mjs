@@ -364,7 +364,7 @@ await check('forget requests become expire operations', async () => {
 })
 
 // ---------------------------------------------------------------------------
-group('6. Persistence (same interface, three drivers, graceful when absent)')
+group('6. Persistence (one interface, every driver, graceful when absent)')
 
 await check('in-process store keeps conversation and memories', async () => {
   resetDatabaseHandle()
@@ -472,6 +472,50 @@ await check('the file store is what a fresh clone actually gets, and says so', a
   delete process.env.RAVEN_DATA_DIR
   resetDatabaseHandle()
   await rm(directory, { recursive: true, force: true })
+})
+
+await check('a memory write that fails on the way to disk is reported as a failure', async () => {
+  // The property under test is the one a demo never shows: the answer must not claim to have
+  // remembered something the storage engine refused. Patch the cached handle rather than the
+  // driver, so the rest of the turn runs against the real adapter.
+  const handle = await getDatabase()
+  const original = handle.adapter
+  handle.adapter = { ...original, remember: async () => { throw new Error('device is read-only') } }
+  try {
+    const turn = await runBrainTurn({ message: 'Remember that I prefer Rust for command-line tools.', sessionId: 'mem-fail-1' })
+    assert.equal(turn.memory.stored, 0, 'the turn claims a write the adapter refused')
+    // The honest sentence contains the word "stored" ("Nothing was stored"), so a substring
+    // test on that verb proves nothing. What must be absent is a *receipt*.
+    assert.match(turn.response, /could not write|did not persist|nothing was stored/i, `the failure was not named: ${turn.response.slice(0, 220)}`)
+    assert.doesNotMatch(turn.response, /Stored \d+ item|\bSaved\b|I.?ll remember|noted that/i, `a failed write was announced as a success: ${turn.response.slice(0, 220)}`)
+    assert.ok(turn.response.length > 0, 'the failure swallowed the answer entirely')
+    assert.notEqual(turn.state, 'ERROR', 'a memory write failure must not fail the whole turn')
+    // `persistence` is where the write was attempted; a refusal that skipped it would mean the
+    // failure was caught somewhere else and mislabelled as a storage problem.
+    assert.ok(turn.metadata.trace.some((event) => /memory|persistence/i.test(event.phase)), 'the trace never reached the persistence phase')
+  } finally {
+    handle.adapter = original
+  }
+})
+
+await check('an empty retrieval is admitted, not papered over', async () => {
+  const turn = await runBrainTurn({ message: 'What does Riyan think about 17th-century Dutch bulb futures?', sessionId: 'empty-retrieval-1' })
+  assert.equal(turn.success, false, 'a question with no evidence in the corpus must not be reported as an answer')
+  assert.equal(turn.citations.length, 0, 'a refusal must not arrive wearing the sources it rejected')
+  assert.equal(turn.verified, false, 'an answer with no evidence is never verified')
+  assert.notEqual(turn.mode, 'genai', 'no provider is configured and no retrieval succeeded')
+  assert.equal(turn.mode, 'offline', 'an ungrounded turn is an offline turn')
+  // And the near-miss case that used to bluff: the glossary missed, the searcher returned
+  // records about the site itself, and the answer claimed the portfolio "does mention" them.
+  const nearby = await runBrainTurn({ message: 'How does Riyan configure Kubernetes operators for quantum annealers?', sessionId: 'empty-retrieval-2' })
+  assert.equal(nearby.citations.length, 0, 'a term absent from every record still produced citations')
+  assert.equal(nearby.verified, false, 'an answer that admits it has no evidence cannot be verified')
+  assert.doesNotMatch(nearby.response, /does mention it/i, 'the portfolio was said to mention something it does not')
+  assert.match(
+    turn.response,
+    /don.?t have|do not have|no record|nothing|not (in|covered)|cannot|can.?t|unable|unavailable|outside/i,
+    `an empty retrieval was answered as if it were known: ${turn.response.slice(0, 220)}`,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -733,6 +777,71 @@ await check('unregistered tools are refused by the planner path too', async () =
   assert.ok(result.response.length > 0)
 })
 
+await check('every turn carries the canonical fields, on both success and refusal', async () => {
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const required = ['success', 'response', 'reply', 'mode', 'state', 'conversationId', 'citations', 'actions', 'memoryUpdates', 'verified', 'provider', 'trace', 'tools', 'memory', 'degraded']
+  const answered = await runBrainTurn({ message: 'What technologies does Riyan use?', sessionId: 'shape-a' })
+  for (const key of required) assert.ok(key in answered, `an answered turn is missing ${key}`)
+  assert.equal(answered.reply, answered.response, 'reply and response drifted apart')
+  assert.equal(answered.provider, 'none', 'a turn with no provider must not name one')
+  assert.deepEqual(answered.trace, answered.metadata.trace, 'the hoisted trace is not metadata.trace')
+  assert.deepEqual(answered.tools, answered.metadata.toolsUsed, 'the hoisted tool list is not what ran')
+  assert.equal(answered.degraded, null, 'a turn that delivered what it planned is not degraded')
+  assert.equal(answered.memory.driver, answered.metadata.database.driver, 'memory.driver disagrees with the database block')
+
+  const refused = await runBrainTurn({ message: 'x'.repeat(99999), sessionId: 'shape-b' })
+  for (const key of required) assert.ok(key in refused, `a refused turn is missing ${key}`)
+  assert.equal(refused.provider, 'none', 'a refusal must still say which provider answered: none')
+  // A turn the brain itself refuses still records the phases it entered; what it must not do
+  // is invent a provider, a tool run or a memory write while doing so.
+  assert.deepEqual(refused.trace, refused.metadata?.trace ?? [], 'a refusal trace disagrees with metadata')
+  assert.deepEqual(refused.tools, [], 'a refused turn ran no tools and must not list any')
+  assert.equal(refused.memory.stored, 0, 'a refused turn stored nothing and must not claim otherwise')
+  assert.equal(refused.verified, false, 'a refusal is never verified')
+})
+
+await check('the mode can never claim more than the provider field admits', async () => {
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const turn = await runBrainTurn({ message: 'Summarise what Riyan built in two sentences.', sessionId: 'claim-a' })
+  // Without a provider the router sends this to the local engine; if a provider were
+  // configured and answered, `provider` would name it. Either way the pair is the promise.
+  if (turn.mode === 'genai') assert.notEqual(turn.provider, 'none', 'mode=genai with provider=none is a bluff')
+  else assert.equal(turn.provider, 'none', `mode=${turn.mode} must not report a provider in this environment`)
+  if (turn.degraded) assert.notEqual(turn.mode, turn.degraded.from, 'a degraded turn cannot still be in the mode it was degraded from')
+  assert.ok(turn.degraded === null || typeof turn.degraded.because === 'string', 'degradation without a reason is not evidence')
+})
+
+await check('the brain layer never imports the voice layer', async () => {
+  // One authoritative voice is a UI concern; the answer must be identical with TTS present,
+  // absent or broken. The cheapest honest guard is the import graph.
+  const { readdirSync, readFileSync } = await import('node:fs')
+  const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? walk(`${dir}/${entry.name}`) : [`${dir}/${entry.name}`]))
+  const offenders = []
+  for (const file of walk('lib/raven')) {
+    if (!/\.ts$/.test(file)) continue
+    const text = readFileSync(file, 'utf8')
+    if (/ravenVoice|speechSync|speechSynthesis/.test(text)) offenders.push(file)
+  }
+  assert.deepEqual(offenders, [], 'the brain reached for the voice layer')
+})
+
+await check('voice resolution is deterministic and prefers a configured feminine voice', async () => {
+  const { resolveRavenVoice } = await import(`${ROOT}/lib/ravenVoice.ts`)
+  const voices = [
+    { name: 'Google UK English Male', lang: 'en-GB', localService: true },
+    { name: 'Microsoft Zira Online (Natural) - English (United States)', lang: 'en-US', localService: true },
+    { name: 'Albert', lang: 'en-GB', localService: true },
+  ]
+  const first = resolveRavenVoice(voices)
+  const second = resolveRavenVoice(voices.slice().reverse())
+  assert.equal(first.voice?.name, second.voice?.name, 'the same voices in a different order picked a different voice')
+  assert.match(first.voice?.name ?? '', /Zira|Female|Aria|Samantha|Victoria|Karen/i, `picked ${first.voice?.name ?? 'nothing'}, which is not the feminine preference`)
+  assert.notEqual(first.source, 'platform-default', 'a platform with usable voices must not fall through to the default')
+  const fallback = resolveRavenVoice([{ name: 'Oddity', lang: 'fr-FR', localService: true }])
+  assert.ok(fallback.voice === null || typeof fallback.voice.name === 'string', 'the fallback is neither a voice nor an explicit none')
+  assert.equal(typeof fallback.source, 'string', 'a fallback must say which rule produced it')
+})
+
 // ---------------------------------------------------------------------------
 group('11. Concurrency (one process, many turns at once)')
 
@@ -797,6 +906,189 @@ await check('the same question twice in a row is answered from retrieval again, 
   const second = await ask('What projects has Riyan built?', { sessionId: 'ses-dup', conversationId: 'conv-dup' })
   assert.ok(first.metadata.trace.some((phase) => /retriev|knowledge/i.test(phase.phase)), 'the first turn never ran retrieval')
   assert.ok(second.metadata.trace.some((phase) => /retriev|knowledge/i.test(phase.phase)), 'the repeat turn skipped retrieval, which means something is cached')
+})
+
+// ---------------------------------------------------------------------------
+group('11b. SQLite adapter (a real local database, still zero dependencies)')
+
+const { createSqliteDatabase, sqliteDialect } = await import(`${ROOT}/lib/raven/db/sqlite.ts`)
+const { SCHEMA_STATEMENTS: SCHEMA, TABLES: SQL_TABLES } = await import(`${ROOT}/lib/raven/db/schema.ts`)
+
+/** The same script of operations, run against any adapter, returning comparable results. */
+const adapterBehaviourScript = async (adapter) => {
+  const iso = (offset) => new Date(Date.UTC(2026, 0, 1, 0, 0, offset)).toISOString()
+  await adapter.upsertConversation({ id: 'c1', sessionId: 's1', title: 'first', createdAt: iso(0), updatedAt: iso(1) })
+  await adapter.upsertConversation({ id: 'c1', sessionId: 's1', title: 'renamed', createdAt: iso(0), updatedAt: iso(9) })
+  for (const [index, role] of ['user', 'raven', 'user', 'raven'].entries()) {
+    await adapter.appendMessage({ id: `m${index}`, conversationId: 'c1', role, content: `turn ${index}`, mode: 'knowledge', state: 'SPEAKING', createdAt: iso(10 + index) })
+  }
+  // Two rows written in the same millisecond must still come back in insertion order.
+  await adapter.appendMessage({ id: 'm-same-a', conversationId: 'c1', role: 'user', content: 'same-ms question', mode: null, state: null, createdAt: iso(40) })
+  await adapter.appendMessage({ id: 'm-same-b', conversationId: 'c1', role: 'raven', content: 'same-ms answer', mode: null, state: null, createdAt: iso(40) })
+  const now = iso(50)
+  await adapter.remember({ id: 'r1', sessionId: 's1', key: 'preference.language', value: 'Rust', importance: 0.9, source: 'explicit', createdAt: now, updatedAt: now })
+  await adapter.remember({ id: 'r2', sessionId: 's1', key: 'note.stack', value: 'Next.js and Postgres', importance: 0.4, source: 'extracted', createdAt: now, updatedAt: now })
+  await adapter.remember({ id: 'r3', sessionId: 'other', key: 'preference.language', value: 'Elixir', importance: 1, source: 'explicit', createdAt: now, updatedAt: now })
+  await adapter.remember({ id: 'r1b', sessionId: 's1', key: 'preference.language', value: 'TypeScript', importance: 0.95, source: 'explicit', createdAt: now, updatedAt: iso(60) })
+  const recent = (await adapter.recentMessages('c1', 100)).map((row) => row.id)
+  const conversations = await adapter.listConversations('s1', 5)
+  const recalled = await adapter.recallMemories('s1', 10)
+  const searched = await adapter.searchMemories('s1', ['rust'], 5)
+  const searchedStack = await adapter.searchMemories('s1', ['postgres', 'next.js'], 5)
+  const expired = await adapter.expireMemory('s1', 'note.stack')
+  const missing = await adapter.expireMemory('s1', 'never.existed')
+  await adapter.startAgentRun({ id: 'a1', conversationId: 'c1', goal: 'plan it', mode: 'agentic', status: 'running', startedAt: now, completedAt: null, steps: [{ id: 's' }], toolsUsed: ['list_projects'], verified: false, result: '' })
+  await adapter.finishAgentRun({ id: 'a1', conversationId: 'c1', goal: 'plan it', mode: 'agentic', status: 'verified', startedAt: now, completedAt: iso(70), steps: [{ id: 's', status: 'ok' }], toolsUsed: ['list_projects', 'get_skills'], verified: true, result: 'done' })
+  await adapter.recordToolRun({ id: 't1', agentRunId: 'a1', conversationId: 'c1', toolName: 'list_projects', input: { a: 1 }, output: { count: 5 }, status: 'succeeded', ms: 12, startedAt: now, finishedAt: now })
+  return {
+    conversations,
+    recent,
+    remembered: recalled.map((memory) => `${memory.key}=${memory.value}:${memory.importance}`),
+    searched: searched.map((memory) => memory.value),
+    searchedStack: searchedStack.map((memory) => memory.value),
+    expired,
+    missing,
+  }
+}
+
+await check('the SQLite adapter behaves identically to the in-process adapter', async () => {
+  const { createMemoryDatabase } = await import(`${ROOT}/lib/raven/db/memoryStore.ts`)
+  const sqlite = await createSqliteDatabase({ path: ':memory:' })
+  const reference = await adapterBehaviourScript(createMemoryDatabase())
+  const actual = await adapterBehaviourScript(sqlite)
+  assert.deepEqual(actual, reference, 'the two adapters answer the same script differently')
+  sqlite.close()
+})
+
+await check('the SQLite schema is derived from the Postgres one, column for column', async () => {
+  // The raw handle, not the adapter: this test is about the DDL translation itself, and the
+  // adapter deliberately exposes no query surface for a test to lean on.
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+  const tables = []
+  for (const statement of SCHEMA) {
+    const table = statement.match(/CREATE TABLE IF NOT EXISTS (\w+)/)?.[1]
+    if (table) {
+      // Build the translated DDL, then read what SQLite actually made of it: comparing the
+      // resulting columns is a real parity check, comparing the two texts would not be.
+      db.exec(sqliteDialect(statement))
+      tables.push(table)
+      const postgresColumns = [...statement.matchAll(/^\s*(\w+)\s+(?:text|integer|real|boolean|jsonb|timestamptz)/gm)].map((match) => match[1])
+      const sqliteColumns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name)
+      assert.deepEqual(sqliteColumns, postgresColumns, `${table}: columns drifted from db/schema.ts`)
+    } else if (statement.startsWith('CREATE INDEX')) {
+      db.exec(sqliteDialect(statement))
+    }
+  }
+  // Expected from TABLES, not a hardcoded number: the day someone adds a table, this test
+  // should follow the source of truth instead of failing on a stale count.
+  assert.deepEqual(
+    tables.slice().sort(),
+    Object.values(SQL_TABLES).sort(),
+    `translated set is ${tables.join(', ') || 'none'}, but the brain names ${Object.values(SQL_TABLES).join(', ')}`,
+  )
+  // Every index the Postgres schema declares must exist here too, or the two engines drift
+  // apart on the queries that are supposed to be fast.
+  const indexes = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'`).all().map((row) => row.name)
+  const declared = SCHEMA.filter((statement) => statement.startsWith('CREATE INDEX')).map((statement) => statement.match(/IF NOT EXISTS (\w+)/)[1])
+  assert.ok(declared.length >= tables.length, 'the schema has fewer indexes than tables; nothing is indexed on one of them')
+  for (const name of declared) assert.ok(indexes.includes(name), `index ${name} is missing from the SQLite translation`)
+  // The four tables are the ones the rest of the brain names, so a rename cannot half-land.
+  assert.deepEqual(tables.sort(), Object.values(SQL_TABLES).sort(), 'the table set does not match TABLES')
+  db.close()
+})
+
+await check('a real file survives close and reopen, which is the point of it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'raven-sqlite-'))
+  const path = join(directory, 'brain.db')
+  const first = await createSqliteDatabase({ path })
+  const now = new Date().toISOString()
+  await first.remember({ id: 'x1', sessionId: 's', key: 'preference.shell', value: 'fish', importance: 0.8, source: 'explicit', createdAt: now, updatedAt: now })
+  await first.upsertConversation({ id: 'c', sessionId: 's', title: 't', createdAt: now, updatedAt: now })
+  await first.appendMessage({ id: 'x2', conversationId: 'c', role: 'raven', content: 'stored before restart', mode: 'knowledge', state: 'SPEAKING', createdAt: now })
+  first.close()
+  const reopened = await createSqliteDatabase({ path })
+  const memories = await reopened.recallMemories('s', 5)
+  assert.equal(memories[0]?.value, 'fish', 'durable memory did not survive the reopen')
+  const history = await reopened.recentMessages('c', 5)
+  assert.equal(history[0]?.content, 'stored before restart', 'conversation did not survive the reopen')
+  reopened.close()
+  await rm(directory, { recursive: true, force: true })
+})
+
+await check('a message with no conversation is refused, loudly, not stored as an orphan', async () => {
+  const db = await createSqliteDatabase({ path: ':memory:' })
+  const now = new Date().toISOString()
+  await assert.rejects(
+    () => db.appendMessage({ id: 'orphan', conversationId: 'ghost-conv', role: 'user', content: 'nowhere to live', mode: null, state: null, createdAt: now }),
+    /does not exist/,
+    'the foreign key was either not enforced or reported uselessly',
+  )
+  assert.deepEqual(await db.recentMessages('ghost-conv', 5), [], 'the rejected row was stored anyway')
+  db.close()
+})
+
+await check('eight simultaneous writes land as eight rows, in order', async () => {
+  const db = await createSqliteDatabase({ path: ':memory:' })
+  const now = new Date().toISOString()
+  await db.upsertConversation({ id: 'cc', sessionId: 'ss', title: 't', createdAt: now, updatedAt: now })
+  await Promise.all(
+    Array.from({ length: 8 }, (_, index) =>
+      db.appendMessage({ id: `w${index}`, conversationId: 'cc', role: index % 2 ? 'raven' : 'user', content: `write ${index}`, mode: null, state: null, createdAt: now }),
+    ),
+  )
+  const rows = await db.recentMessages('cc', 50)
+  assert.equal(rows.length, 8, `${rows.length} of 8 concurrent writes were lost`)
+  assert.deepEqual(rows.map((row) => row.content), Array.from({ length: 8 }, (_, index) => `write ${index}`), 'concurrent writes came back out of order')
+  db.close()
+})
+
+await check('SQL in a stored value is data, not syntax', async () => {
+  const db = await createSqliteDatabase({ path: ':memory:' })
+  const now = new Date().toISOString()
+  // No underscore in the fixture on purpose: this value is later searched for `_`, and a
+  // key that already contains one would make that assertion meaningless.
+  const hostile = "'); DROP TABLE memories;--"
+  await db.remember({ id: 'h1', sessionId: 'sh', key: 'note.' + hostile, value: hostile, importance: 0.5, source: 'extracted', createdAt: now, updatedAt: now })
+  const found = await db.recallMemories('sh', 5)
+  assert.equal(found[0]?.value, hostile, 'the bound value was altered')
+  // `%` and `_` are LIKE wildcards; a term containing them must not match the whole table.
+  await db.remember({ id: 'h2', sessionId: 'sh', key: 'other', value: 'percent % signs everywhere', importance: 0.5, source: 'extracted', createdAt: now, updatedAt: now })
+  // Escaping is only observable if you pick a term that would match *something else* when
+  // unescaped: `_` means "any single character", so an unescaped one returns every row with
+  // any character in it, and an escaped one returns only rows containing a literal underscore.
+  const underscore = await db.searchMemories('sh', ['_'], 10)
+  assert.equal(underscore.length, 0, 'a bare _ was treated as a wildcard and matched rows without one')
+  const percent = await db.searchMemories('sh', ['%'], 10)
+  assert.deepEqual(percent.map((memory) => memory.key), ['other'], 'a literal % should match only the row that contains one')
+  db.close()
+})
+
+await check('an unusable SQLite path degrades with a written reason instead of failing boot', async () => {
+  resetDatabaseHandle()
+  const config = ravenConfig()
+  const handle = await getDatabase({
+    ...config,
+    database: { ...config.database, forced: 'sqlite', sqlitePath: process.platform === 'win32' ? 'Z:\nope\nope.db' : '/dev/null/raven.db' },
+  })
+  assert.notEqual(handle.driver, 'sqlite', 'an unopenable path must not be reported as the driver')
+  assert.ok(handle.notes.join(' ').match(/sqlite/i), 'the downgrade did not say which driver failed and why')
+  resetDatabaseHandle()
+})
+
+await check('RAVEN_DB_DRIVER accepts every real driver name, including postgres-rest', async () => {
+  const previous = process.env.RAVEN_DB_DRIVER
+  try {
+    for (const driver of ['postgres', 'postgres-rest', 'sqlite', 'file', 'memory']) {
+      process.env.RAVEN_DB_DRIVER = driver
+      assert.equal(ravenConfig().database.forced, driver, `RAVEN_DB_DRIVER=${driver} was ignored by config`)
+    }
+    process.env.RAVEN_DB_DRIVER = 'quantum'
+    assert.equal(ravenConfig().database.forced, null, 'an unknown driver name must not be forced')
+  } finally {
+    if (previous === undefined) delete process.env.RAVEN_DB_DRIVER
+    else process.env.RAVEN_DB_DRIVER = previous
+  }
 })
 
 // ---------------------------------------------------------------------------

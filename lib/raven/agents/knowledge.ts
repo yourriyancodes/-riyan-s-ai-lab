@@ -280,12 +280,30 @@ export function composeKnowledgeAnswer(input: KnowledgeInput): KnowledgeAnswer |
         }
       }
       if (hits.length) {
-        const bullets = hits.slice(0, 2).map((hit) => `${hit.title}: ${clip(hit.body.replace(/\n+/g, ' '), 260)}`)
+        // "The portfolio data does mention it" is a claim about the corpus, so it is only
+        // allowed when the corpus contains the word. Lexical search happily returns the site
+        // description for a question about quantum annealers — one shared particle is a match
+        // to a scorer and a fabrication to a reader. Without this gate the agent shipped an
+        // off-topic listing as a verified answer, which is the exact failure the whole
+        // grounding layer exists to prevent.
+        const asked = String(concept?.term ?? '').trim().toLowerCase()
+        const mentioning = asked
+          ? hits.filter((hit) => `${hit.title} ${hit.body}`.toLowerCase().includes(asked))
+          : []
+        if (!mentioning.length) {
+          return {
+            answer: `The glossary has no entry for "${asked || 'that term'}", and none of the ${hits.length} record(s) the search returned actually mention it, so there is nothing grounded to say. ${hits.slice(0, 2).map((hit) => `${hit.title} is about something else`).join('; ')}.`,
+            citations: [],
+            toolsUsed,
+            note: 'glossary missed and no corpus record contains the term; refused instead of listing near-misses',
+          }
+        }
+        const bullets = mentioning.slice(0, 2).map((hit) => `${hit.title}: ${clip(hit.body.replace(/\n+/g, ' '), 260)}`)
         return {
           answer: `The glossary has no entry for that term, but the portfolio data does mention it:${BULLET}${bullets.join(BULLET)}`,
           citations,
           toolsUsed,
-          note: 'answered from corpus hits because the glossary missed',
+          note: `answered from ${mentioning.length} corpus record(s) that contain the term`,
         }
       }
       return null

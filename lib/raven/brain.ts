@@ -181,9 +181,13 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
   }): RavenResponse => {
     const trace = [...tracker.events]
     if (tracker.refusals.length) trace.push({ state: parts.state, phase: 'transition-guard', atMs: tracker.elapsed(), ms: 0, note: tracker.refusals.join('; ') })
+    const degraded = parts.route.degradedFrom
+      ? { from: parts.route.degradedFrom, because: parts.route.degradedBecause ?? 'not recorded' }
+      : null
     return {
       success: parts.success,
       response: parts.response,
+      reply: parts.response,
       mode: parts.mode,
       state: parts.state,
       conversationId,
@@ -191,6 +195,13 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       actions: parts.actions,
       memoryUpdates: parts.memoryUpdates,
       verified: parts.verified,
+      // Three ways the same turn is measured, each derived from what actually happened:
+      // which engine answered, which tools ran, and which memories were read or written.
+      provider: parts.provider?.id ?? 'none',
+      trace,
+      tools: parts.toolsUsed,
+      memory: { retrieved: parts.memory.retrieved, stored: parts.memory.stored, driver: parts.database.driver },
+      degraded,
       ...(parts.error ? { error: parts.error } : {}),
       metadata: {
         trace,
@@ -518,7 +529,11 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         response: `I could not ground an answer for that in this portfolio's data, and I do not invent one. ${retrieval.errors.length ? `Retrieval reported: ${retrieval.errors.map((error) => `${error.tool} ${error.status}`).join('; ')}. ` : ''}Ask about the projects, skills, experiments, contact details, or how this backend works — or configure a provider for open-ended questions.`,
         mode: 'offline',
         state: 'OFFLINE',
-        citations,
+        // A refusal cites nothing. These are the records retrieval returned and the composer
+        // then rejected, so attaching them made a shrug arrive with four SOURCES chips on it —
+        // evidence for no claim reads as a claim about all of it. The tool list below stays,
+        // because the tools really did run; only the citation set goes empty.
+        citations: [],
         memoryUpdates: extraction.updates,
         actions: memoryResult.actions,
         verified: false,

@@ -92,6 +92,24 @@ export function verifyAnswer(input: VerifyInput): VerificationReport {
     blocking: true,
   })
 
+  // `claims-grounded` above is intent-scoped, which left a hole: an off-topic retrieval
+  // listing under an intent like `explain.concept` carried no citation requirement at all, so
+  // a paragraph of near-misses shipped with a verified badge. Any turn that presents itself as
+  // retrieved knowledge needs something retrieved behind it — and a model cannot supply that
+  // evidence with its own sentence, which is why this test reads `grounding`, not `citations`.
+  const presentingAsGrounded = input.mode === 'knowledge' || input.mode === 'agentic' || (input.mode === 'genai' && input.provider != null)
+  const evidenceCount = grounding.length
+  checks.push({
+    name: 'grounded-mode-has-evidence',
+    ok: !presentingAsGrounded || evidenceCount > 0,
+    note: presentingAsGrounded
+      ? evidenceCount
+        ? `${evidenceCount} non-provider citation(s) behind a ${input.mode} answer`
+        : `a ${input.mode} answer with nothing but its own text to stand on`
+      : `${input.mode} answer is not presented as grounded knowledge`,
+    blocking: true,
+  })
+
   const claims = ACTION_CLAIMS.filter((entry) => entry.pattern.test(answer))
   for (const claim of claims) {
     const supported = succeededTools.has(claim.tool) || input.actions.some((action) => action.tool === claim.tool && action.status === 'executed')

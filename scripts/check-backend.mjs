@@ -383,6 +383,23 @@ await check('invalid JSON, missing message and empty message are all rejected', 
   assert.equal(data.state, 'OFFLINE')
 })
 
+await check('a rejection carries the canonical fields and invents nothing', async () => {
+  resetRateLimiter()
+  const rejected = await ravenRoute.POST(post({ notMessage: 'typo in the client' }, { headers: { 'x-forwarded-for': '203.0.113.44' } }))
+  assert.equal(rejected.status, 422, 'a body without a message must be a validation failure')
+  const json = await rejected.json()
+  for (const key of ['success', 'response', 'reply', 'mode', 'state', 'citations', 'actions', 'memoryUpdates', 'verified', 'provider', 'trace', 'tools', 'memory', 'degraded']) {
+    assert.ok(key in json, `a 4xx response is missing ${key}; consumers should not have to branch on status`)
+  }
+  assert.equal(json.reply, json.response, 'the alias drifted from the message')
+  assert.equal(json.provider, 'none', 'a rejection names no provider')
+  assert.deepEqual(json.trace, [], 'a request the router never ran has no phases to report')
+  assert.deepEqual(json.tools, [], 'a request the router never ran used no tools')
+  assert.equal(json.degraded, null, 'a rejection is not a degradation, it is a refusal')
+  assert.equal(json.memory.retrieved, 0, 'nothing was read and nothing may be claimed')
+  assert.equal(json.verified, false, 'a refusal is never verified')
+})
+
 await check('the rate limiter returns 429 with a usable retry-after', async () => {
   resetRateLimiter()
   process.env.RAVEN_RATE_MAX = '2'

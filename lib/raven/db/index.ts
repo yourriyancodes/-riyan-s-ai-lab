@@ -33,6 +33,7 @@ function candidatesFor(config: RavenConfig): DatabaseDriver[] {
     const rest: DatabaseDriver[] = []
     if (forced !== 'memory' && database.url && forced !== 'postgres') rest.push('postgres')
     if (forced !== 'memory' && database.restUrl && database.restKey && forced !== 'postgres-rest') rest.push('postgres-rest')
+    if (forced !== 'memory' && database.sqlitePath && forced !== 'sqlite') rest.push('sqlite')
     if (allowFileStore && forced !== 'file') rest.push('file')
     if (forced !== 'memory') rest.push('memory')
     return [forced, ...rest]
@@ -40,6 +41,10 @@ function candidatesFor(config: RavenConfig): DatabaseDriver[] {
   const list: DatabaseDriver[] = []
   if (database.url) list.push('postgres')
   if (database.restUrl && database.restKey) list.push('postgres-rest')
+  // An explicit SQLite path is an unambiguous request for it — a real database with real
+  // transactions and no dependency. Without one, the file store stays the default, because
+  // `node:sqlite` is still experimental and a fresh clone should not quietly depend on it.
+  if (database.sqlitePath) list.push('sqlite')
   if (allowFileStore) list.push('file')
   list.push('memory')
   return list
@@ -47,6 +52,26 @@ function candidatesFor(config: RavenConfig): DatabaseDriver[] {
 
 async function build(driver: DatabaseDriver, config: RavenConfig): Promise<{ ok: true; adapter: DatabaseAdapter } | { ok: false; error: string }> {
   if (driver === 'memory') return { ok: true, adapter: createMemoryDatabase() }
+
+  if (driver === 'sqlite') {
+    const target = config.database.sqlitePath
+    if (!target) return { ok: false, error: 'RAVEN_SQLITE_PATH is not set (sqlite needs a file path)' }
+    try {
+      // Lazy import, same reason as the file store: `node:sqlite` must not appear in a
+      // bundle built for a runtime that lacks it. On an older Node this throws
+      // ERR_UNKNOWN_BUILTIN_MODULE, which becomes a written downgrade reason below.
+      const { createSqliteDatabase } = await import('./sqlite')
+      const { mkdir } = await import('node:fs/promises')
+      const { dirname, resolve } = await import('node:path')
+      const path = resolve(/* turbopackIgnore: true */ process.cwd(), target)
+      await mkdir(dirname(path), { recursive: true })
+      const adapter = await createSqliteDatabase({ path })
+      await adapter.ensureSchema()
+      return { ok: true, adapter }
+    } catch (error) {
+      return { ok: false, error: `sqlite at ${config.database.sqlitePath}: ${(error as Error)?.message ?? 'unopenable'}`.slice(0, 400) }
+    }
+  }
 
   if (driver === 'file') {
     if (!config.allowFileStore) return { ok: false, error: 'RAVEN_ALLOW_FILE_STORE=0 (disk writes disabled)' }
@@ -153,6 +178,7 @@ export function resetDatabaseHandle(): void {
 
 export { SCHEMA_SQL, SCHEMA_STATEMENTS, TABLES } from './schema'
 export { createMemoryDatabase } from './memoryStore'
+export { createSqliteDatabase } from './sqlite'
 export { createFileDatabase } from './fileStore'
 export { createPostgresDatabase, connectPostgres } from './postgres'
 export { createSupabaseRestDatabase } from './supabaseRest'

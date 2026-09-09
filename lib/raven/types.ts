@@ -357,6 +357,13 @@ export type RavenError = { code: string; message: string; retryAfterMs?: number 
 export type RavenResponse = {
   success: boolean
   response: string
+  /**
+   * `reply` is the name the response standardises on; `response` stays because the console,
+   * the typed client and the persisted transcript already read it. They are always the same
+   * string — an alias, not a second source of truth — so renaming the field later cannot
+   * silently break a consumer.
+   */
+  reply: string
   mode: RavenMode
   state: RavenState
   conversationId: string
@@ -364,6 +371,15 @@ export type RavenResponse = {
   actions: ProposedAction[]
   memoryUpdates: MemoryUpdate[]
   verified: boolean
+  /** `'none'`, or the id that actually produced the answer. Never inferred (P3). */
+  provider: string
+  /** The phases this turn really entered, hoisted so a caller need not unpack `metadata`. */
+  trace: PhaseEvent[]
+  /** Names of the tools that ran. Empty means nothing ran, and nothing was faked. */
+  tools: string[]
+  memory: { retrieved: number; stored: number; driver: string }
+  /** Why the router delivered less than it planned, e.g. a provider that failed. */
+  degraded: { from: RavenMode; because: string } | null
   error?: RavenError
   metadata?: RavenMetadata
 }
@@ -372,7 +388,7 @@ export type RavenResponse = {
  * Persistence
  * ------------------------------------------------------------------ */
 
-export type DatabaseDriver = 'postgres' | 'postgres-rest' | 'file' | 'memory'
+export type DatabaseDriver = 'postgres' | 'postgres-rest' | 'sqlite' | 'file' | 'memory'
 
 export type DatabaseStatus = {
   driver: DatabaseDriver

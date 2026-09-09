@@ -47,9 +47,11 @@ export type RavenConfig = {
   }
   database: {
     url: string | null
-    /** Forced driver wins; otherwise postgres when a URL exists, else file, else memory. */
+    /** Forced driver wins; otherwise postgres → (sqlite if a path is set) → file → memory. */
     forced: DatabaseDriver | null
     dataDir: string
+    /** Set RAVEN_SQLITE_PATH to a file to prefer the SQLite adapter over the JSON store. */
+    sqlitePath: string | null
     timeoutMs: number
     /** Supabase REST (PostgREST) transport — the dependency-free managed option. */
     restUrl: string | null
@@ -109,9 +111,15 @@ export function ravenConfig(): RavenConfig {
   const baseUrl = env('RAVEN_BASE_URL') ?? null
   const id = apiKey || baseUrl ? resolveProviderId(apiKey ?? undefined) : null
   const dataDir = env('RAVEN_DATA_DIR') ?? '.raven-data'
+  // Every real driver name is accepted here. `postgres-rest` was missing from this list
+  // until the sqlite work, which meant `RAVEN_DB_DRIVER=postgres-rest` was silently ignored
+  // and the auto order ran instead — the config said one driver, the process used another.
   const forcedRaw = env('RAVEN_DB_DRIVER')?.toLowerCase()
   const forced: DatabaseDriver | null =
-    forcedRaw === 'postgres' || forcedRaw === 'file' || forcedRaw === 'memory' ? forcedRaw : null
+    forcedRaw === 'postgres' || forcedRaw === 'postgres-rest' || forcedRaw === 'sqlite' || forcedRaw === 'file' || forcedRaw === 'memory'
+      ? (forcedRaw as DatabaseDriver)
+      : null
+  const sqlitePath = env('RAVEN_SQLITE_PATH') ?? null
   const url = env('DATABASE_URL') ?? env('SUPABASE_DB_URL') ?? null
 
   return {
@@ -145,6 +153,10 @@ export function ravenConfig(): RavenConfig {
       url,
       forced,
       dataDir,
+      // Explicit path means "use SQLite for this". Unset means SQLite is only reached when
+      // RAVEN_DB_DRIVER asks for it, so a fresh clone keeps the dependency-free file store
+      // instead of silently taking on an experimental runtime API.
+      sqlitePath,
       timeoutMs: int('RAVEN_DB_TIMEOUT_MS', 5000),
       restUrl: env('SUPABASE_URL') ?? null,
       // Anon key is acceptable only if RLS allows the service writes; a service-role key

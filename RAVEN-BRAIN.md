@@ -68,6 +68,42 @@ round are `components/RavenConsole.tsx`, `lib/ravenStore.ts`, `lib/raven/intent.
 `components/Raven3D.tsx`, `app/globals.css`, the portrait module and `lib/ravenVoice.ts`
 are byte-identical to the commit that closed the visual work.
 
+### 1.2 This round: the database, the near-miss bluff, and the response contract
+
+Four things changed, and three of them were found by testing behaviour instead of reading
+code. Live GenAI was audited first and is **still not available in this sandbox** — no
+`RAVEN_API_KEY`, nothing listening on 11434/1234, no `ollama`/`llama-server`/`vllm` binary —
+so the provider layer keeps its configured-but-unproven status and nothing here claims
+otherwise (see §7 and §13).
+
+1. **A fifth database driver, still with no dependency.** `lib/raven/db/sqlite.ts` implements
+   all 13 adapter methods over `node:sqlite`, with DDL *derived* from `db/schema.ts`. It is
+   opt-in (`RAVEN_SQLITE_PATH`), the file store stays the default, and the schema-parity test
+   exists because a translated schema is exactly the kind of thing that rots silently. Two
+   ordinary bugs surfaced while wiring it: `RAVEN_DB_DRIVER=postgres-rest` was silently
+   dropped by the config parser, and `'[]'::jsonb` became `'[]'::TEXT` because the cast
+   rewrite ran after the type rewrite.
+2. **The near-miss bluff in `explain.concept` is closed.** When the local glossary had no
+   entry, the composer listed whichever records the lexical searcher scored highest and said
+   *"the portfolio data does mention it"* — for *"How does Riyan configure Kubernetes
+   operators for quantum annealers?"*, quoting the site tagline. `verified` was `true`
+   because the verifier only demands evidence for `portfolio.*` intents. Now a hit must
+   contain the term to be presented as a mention, and the new
+   `grounded-mode-has-evidence` check refuses to certify a grounded-mode answer that has
+   nothing but its own text.
+3. **The classifier stopped reading English as an anchor.** `extractSection()` used
+   `lower.includes(id)`, so the preposition in *"what does Riyan think **about** bulb
+   futures"* named the `#about` section at 0.98 confidence and answered with a section list.
+   Section references now have to look like references (`#about`, "the about section",
+   "scroll to contact"); `experience`/`journey` still map to a section but as an *entity*,
+   never as a vote; `identity.riyan` gained the second-person phrasings it was missing; and
+   `identity.raven` now recognises "tell me about yourself", which previously produced a
+   section listing too.
+4. **A refusal cites nothing.** The ungrounded-answer path attached the four records
+   retrieval had just *rejected*, so a shrug arrived wearing four SOURCES chips — evidence
+   for no claim. `citations` is empty on that path now; `tools` still shows what ran,
+   because that part happened.
+
 ---
 
 ## 2. Layer map
@@ -80,7 +116,7 @@ are byte-identical to the commit that closed the visual work.
                  │        lib/raven/brain.ts   ◄── the only orchestrator      │
                  │                │                                           │
    CONTEXT ◄─────┼── memory/service.ts  ── db/ (postgres · postgres-rest ·   │
-                 │                          file · memory)                    │
+                 │                          sqlite · file · memory)           │
    INTENT  ◄─────┼── intent.ts             → 19 intents, rule-weighted       │
    ROUTER  ◄─────┼── router.ts             → knowledge | genai | agentic |   │
                  │                            offline                        │
@@ -138,16 +174,17 @@ The turn's `metadata.trace` is one `PhaseEvent` per phase with **measured** dura
 
 ## 4. Database layer (`lib/raven/db/`)
 
-`DatabaseAdapter` (`lib/raven/types.ts`) is the whole contract — 12 methods:
+`DatabaseAdapter` (`lib/raven/types.ts`) is the whole contract — 13 methods:
 conversation upsert/read, message append/read, memory remember/recall/search/expire,
 agent-run start/finish, tool-run record, plus `status()` and `ensureSchema()`.
 
-Four drivers implement it:
+Five drivers implement it (the last two are not installed by default and neither is required):
 
 | Driver | Transport | Requires | Used when |
 | --- | --- | --- | --- |
 | `postgres` | `pg` pool, dynamic runtime import | `DATABASE_URL` **and** `npm i pg` | a connection string exists and `pg` resolves |
 | `postgres-rest` | `fetch` → Supabase PostgREST | `SUPABASE_URL` + `SUPABASE_DB_KEY` | Supabase is configured; no dependency, serverless-safe |
+| `sqlite` | `node:sqlite` (`DatabaseSync`), WAL, one file | Node 22.5+ **and** `RAVEN_SQLITE_PATH` | opted in — transactions and foreign keys, still zero dependencies |
 | `file` | JSON files, atomic temp+rename, serialized write queue | writable `RAVEN_DATA_DIR` | **default on a fresh clone** — real persistence, zero setup |
 | `memory` | in-process Maps | nothing | tests, or when disk is unavailable |
 
@@ -156,6 +193,25 @@ Resolution (`db/index.ts`) tries candidates in order, records every rejection in
 it needs a null-check to stay alive; `metadata.database.detail` carries the reason for a
 downgrade, e.g. `file store unavailable: EACCES …; degraded from: postgres: the "pg"
 package is not installed (…)`.
+
+The SQLite driver is the one to reach for when the JSON store stops being enough and a
+database server is still more than a hobby project should carry. Two things about it are
+deliberate:
+
+* **The DDL is not a second schema.** `db/schema.ts` holds the Postgres statements and
+  `sqliteDialect()` translates them (`timestamptz`→`TEXT`, `jsonb`→`TEXT`, `now()`→
+  `CURRENT_TIMESTAMP`, `boolean`→`INTEGER`, casts stripped). A test asserts that every
+  translated table and index comes out with the same columns, so the two engines cannot
+  drift apart quietly.
+* **Foreign keys are enforced.** `PRAGMA foreign_keys = ON` means a message whose
+  conversation was never written is *rejected* rather than stored as an orphan that nobody
+  lists. That is a real behavioural difference from the `file` and `memory` drivers, which
+  accept it; `appendMessage` re-throws with `message <id> was not stored: conversation <id>
+  does not exist`, so a caller learns the reason instead of losing rows in silence.
+
+It stays opt-in because `node:sqlite` is still marked experimental: a fresh clone must not
+depend on a module that could change under it. When it is unavailable or the path is
+unusable, `resolveDatabase()` records `sqlite: …` in `notes` and continues on `file`.
 
 ### Schema
 
@@ -363,6 +419,10 @@ Independent of whoever produced the text. Blocking checks set `verified`:
 
 - `answer-present` — non-trivial text.
 - `claims-grounded` — a `portfolio.*` or identity claim needs ≥1 citation.
+- `grounded-mode-has-evidence` — a `knowledge`/`agentic` turn (or a `genai` one that had a
+  real provider behind it) must have ≥1 **non-provider** citation. `claims-grounded` is
+  intent-scoped, which left a hole: an off-topic retrieval listing under a different intent
+  carried no citation requirement at all and shipped with a verified badge.
 - `action-claim:<tool>` — if the answer says it saved/forgot/scrolled something, a
   **succeeded run of that tool** must exist in this turn. This is the rule that makes
   "it never claims an action it did not perform" mechanically true, and it applies to
@@ -393,6 +453,21 @@ but appends `I could not fully verify that … treat it as unconfirmed` and ship
 `422 empty_input`, `413 too_long`/`body_too_large`, `429 rate_limited` (+`retry-after`).
 Brain-level failures return the same response shape with `success:false`, `mode:'offline'`
 and `state:'OFFLINE'|'ERROR'` — a client never has to branch on shape before rendering.
+
+Every response, refusal included, carries the canonical set at the top level:
+
+```
+reply · mode · state · verified · provider · citations · trace · tools · memory · degraded · error?
+```
+
+`reply` is an alias of `response`, not a second string: they are always identical, and the
+older name stays because the console and the typed client already read it. `provider` is
+`'none'` or the id that actually answered — the *structured* provider record, `null` when
+nothing was configured, remains at `metadata.provider`, which is why the two look different
+and are not redundant. `trace` is `metadata.trace` verbatim (hoisted, not copied from a
+second source). `tools` is the list of tools that really ran, so an empty array means the
+turn executed nothing. `degraded` is `null` unless the router planned more than it delivered,
+in which case it names the mode it came down from and why.
 
 Real response for `which project best demonstrates retrieval?` on a machine with no key
 and no database (trimmed):
@@ -460,17 +535,48 @@ Three rules, each asserted in `check-backend.mjs`:
 
 `RAVEN_LOG=0` silences it; the backend suite sets that so its output stays readable.
 
+### 11.2 Proving the provider path with no provider
+
+`mode:'genai'` is not something to take on faith, and it does not need a paid endpoint to be
+tested. A ~30-line OpenAI-compatible server on `127.0.0.1` that answers `/v1/models` and
+`/v1/chat/completions` — and can be told to return 401, 500, or nothing at all by the text
+of the prompt it receives — is enough to drive the real code path:
+
+```bash
+node /tmp/genai-stub.mjs &                       # a stub that speaks the wire format
+RAVEN_BASE_URL=http://127.0.0.1:3199/v1 RAVEN_API_KEY=local-test-key \
+  RAVEN_MODEL=stub-1 RAVEN_MAX_RETRIES=0 npm run dev
+```
+
+Measured against it, on a running server:
+
+| Situation | Response |
+| --- | --- |
+| stub answers | `mode:genai`, `provider:openai-compatible`, `verified:true`, 4 citations |
+| stub returns 500 | `mode:knowledge`, `provider:none`, `degraded.because` names the 500 and the upstream text |
+| second failure | `x-raven-breaker: open` — later turns skip the endpoint and answer locally (~40 ms instead of ~1.5 s) |
+| stub never answers | the client's own timeout ends the turn at `RAVEN_TIMEOUT_MS`, then the same degrade |
+| key is rejected (401) | degraded locally with the reason visible; the breaker opens on the first one, because a bad key does not fix itself |
+
+The key appears in none of it: not the body, not the headers, not `raven.turn` (`grep -c` of
+the key in the server log returned 0). And the labels stay true in both directions — this
+demonstrates that the *plumbing* is real, which is not the same claim as "a model answered
+you": with no provider configured every turn says `provider: 'none'`, which is what every
+probe in this repository has actually recorded.
+
 ## 12. Testing locally
 
 No model, no database, no network needed:
 
 ```bash
 npm run check            # typecheck + schema drift + assets + speech + face + brain + backend
-npm run check:brain      # 65 checks: states, intents, retrieval, tools, memory, drivers,
-                         #   honesty, degradation, contract hygiene, concurrency, and the
-                         #   intent shapes the browser actually types
-npm run check:backend    # 29 checks: Gemini + OpenAI-compatible transports against a real
-                         #   local HTTP server, Supabase REST over real HTTP, both routes
+npm run check:brain      # 79 checks: states, intents, retrieval, tools, memory, drivers
+                         #   (including the SQLite one and its schema-parity proof), honesty,
+                         #   degradation, canonical response contract, deterministic voice
+                         #   selection, concurrency, and the intent shapes the browser types
+npm run check:backend    # 31 checks: Gemini + OpenAI-compatible transports against a real
+                         #   local HTTP server, Supabase REST over real HTTP, both routes,
+                         #   the one-line-per-turn log, and a rejection's field set
 npm run typecheck
 npm run schema           # regenerate db/schema.sql after editing schema.ts
 ```

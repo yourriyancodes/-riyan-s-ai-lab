@@ -31,6 +31,7 @@ const json = (body: unknown, status: number, headers: Record<string, string> = {
 const rejection = (message: string, conversationId: string, code: string, extra: Record<string, unknown> = {}): RavenResponse & Record<string, unknown> => ({
   success: false,
   response: message,
+  reply: message,
   mode: 'offline',
   state: 'OFFLINE',
   conversationId,
@@ -38,6 +39,13 @@ const rejection = (message: string, conversationId: string, code: string, extra:
   actions: [],
   memoryUpdates: [],
   verified: false,
+  // A rejection carries the same shape as an answer on purpose: a consumer should never have
+  // to know which branch it is rendering to read the fields it reads every time.
+  provider: 'none',
+  trace: [],
+  tools: [],
+  memory: { retrieved: 0, stored: 0, driver: 'none' },
+  degraded: null,
   error: { code, message, ...extra },
 })
 

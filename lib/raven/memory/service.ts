@@ -9,14 +9,16 @@
  * Both are best-effort by design: every path here swallows adapter failures into
  * `errors`, because losing memory must downgrade the answer, never break it.
  */
-import type { ConversationMessageRecord, DatabaseAdapter, MemoryRecord, MemoryUpdate, RavenMode, RavenState } from '../types'
+import type { ConversationMessageRecord, DatabaseAdapter, MemoryRecord, MemoryUpdate, RavenMode, RavenState, DatabaseDriver } from '../types'
 import { tokenize } from '../knowledge/search'
 
 export type ContextBundle = {
   conversationId: string
   recent: ConversationMessageRecord[]
   memories: MemoryRecord[]
-  source: 'postgres' | 'postgres-rest' | 'file' | 'memory' | 'none'
+  /** Derived from the driver union, so a new adapter cannot be forgotten here and fail
+   *  the build the way the literal list did when `sqlite` was added. */
+  source: DatabaseDriver | 'none'
   errors: string[]
 }
 

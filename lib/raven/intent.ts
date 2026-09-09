@@ -16,7 +16,9 @@ const RULES: Rule[] = [
   {
     intent: 'identity.raven',
     weight: 3,
-    patterns: [/\b(who|what) are you\b/, /\byour name\b/, /\bwhat is raven\b/, /\bwho is raven\b/, /\bare you human\b/, /\bare you real\b/, /\bwere you built\b/, /\bwhat are you\b/],
+    // "tell me about yourself" used to land on the section list, because the only rule that
+    // matched anything was a substring test that saw "about" and named the #about section.
+    patterns: [/\b(who|what) are you\b/, /\byour name\b/, /\bwhat is raven\b/, /\bwho is raven\b/, /\bare you human\b/, /\bare you real\b/, /\bwere you built\b/, /\btell me about (yourself|you)\b/, /\bintroduce yourself\b/],
     signals: ['raven-identity'],
   },
   {
@@ -48,7 +50,13 @@ const RULES: Rule[] = [
   {
     intent: 'identity.riyan',
     weight: 3,
-    patterns: [/\bwho is riyan\b/, /\btell me about riyan\b/, /\babout riyan\b/, /\bwhat does riyan do\b/, /\bwho is he\b/, /\bhis background\b/, /\bintroduce riyan\b/, /\bwhat is riyan.?s (role|work|focus)\b/],
+    patterns: [/\bwho is riyan\b/, /\btell me about riyan\b/, /\babout riyan\b/, /\bwhat does riyan do\b/, /\bwho is he\b/, /\bhis background\b/, /\bintroduce riyan\b/, /\bwhat is riyan.?s (role|work|focus)\b/,
+      // "tell me about your experience" addresses the portfolio's owner without naming them,
+      // and used to fall through to the section list because nothing else matched. The second
+      // and third patterns are the same request in the second person, phrased as people type it.
+      // Deliberately noun-specific: `stack` and `tools` belong to the skills intent, and a
+      // greedy "tell me about your…" stole every one of those lookups.
+      /\b(your|his|the founder.?s) (experience|background|journey|story|work)\b/, /\bwhat (is|was) (your|his) (background|journey|story)\b/],
     signals: ['riyan-identity'],
   },
   {
@@ -172,11 +180,28 @@ function extractProjectReference(text: string): string | null {
 
 const SECTION_IDS = ['hero', 'projects', 'skills', 'about', 'contact'] as const
 
-function extractSection(text: string): string | null {
+/**
+ * A section reference has to *look like* one. The first version of this function asked
+ * `lower.includes(id)`, which is a substring test on ordinary English: "what does Riyan
+ * think **about** bulb futures" named the #about section at 0.98 confidence and answered with
+ * a list of page sections, and "**skills**" inside "what skills do you lack" would have done
+ * the same. A bare word is a reference only when it is anchored (#about) or sitting next to
+ * a word that makes it one ("the about section", "scroll to contact").
+ *
+ * `topic` results are the deliberately weaker class: "tell me about your experience" has no
+ * section word in it at all, and used to work, so the mapping stays — but it can no longer
+ * outvote a lookup, which is what the weight at the call site is for.
+ */
+type SectionReference = { id: (typeof SECTION_IDS)[number]; kind: 'explicit' | 'topic' }
+
+const SECTION_ANCHOR = (id: string) =>
+  new RegExp(`#${id}\\b|\\b${id}\\b\\s*(?:section|part|anchor|block)|(?:section|anchor|menu\\s+item|part\\s+of\\s+the\\s+(?:page|site))\\b[^?]{0,20}\\b${id}\\b|(?:scroll|jump|navigate|go|open|show|link|jump)\\b[^?]{0,14}\\b${id}\\b`)
+
+function extractSection(text: string): SectionReference | null {
   const lower = normalize(text)
-  for (const id of SECTION_IDS) if (lower.includes(id)) return id
-  if (/\bexperience\b|\bjourney\b/.test(lower)) return 'about'
-  if (/\bexperiments\b/.test(lower)) return 'projects'
+  for (const id of SECTION_IDS) if (SECTION_ANCHOR(id).test(lower)) return { id, kind: 'explicit' }
+  if (/\bexperience\b|\bjourney\b/.test(lower)) return { id: 'about', kind: 'topic' }
+  if (/\bexperiments\b/.test(lower)) return { id: 'projects', kind: 'topic' }
   return null
 }
 
@@ -212,8 +237,16 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
 
   const section = extractSection(text)
   if (section) {
-    add('portfolio.sections', 1.2, ['named-section'])
-    if (scores.has('action.navigate')) add('action.navigate', 1.6, ['section-target'])
+    // Explicit references keep the old weight; a topic-only hint is a tiebreaker, not a
+    // verdict, so a question that merely contains "about" cannot beat the intent it asks.
+    // Only an explicit reference is an intent. A topic hint ("experience" → about) is
+    // recorded in `entities` so a composer can use it, but letting it vote turned "does
+    // Riyan have experience with Kubernetes operators" into a confident request for the
+    // section list — a question about a technology with nothing in this corpus to answer it.
+    if (section.kind === 'explicit') {
+      add('portfolio.sections', 1.2, ['section:explicit'])
+      if (scores.has('action.navigate')) add('action.navigate', 1.6, ['section-target'])
+    }
   }
 
   // A bare project mention with a question word is a lookup, not a list request.
@@ -239,11 +272,15 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
       /^\s*(?:thanks?|thank you|ty|ok(?:ay)?|nice|cool|great|awesome|bye|goodbye|see ya|later|lol|hmm+|yep|yeah|nope|hi|hello|hey|yo|sup|howdy|morning|evening)\b[\s!.,?]*$/i.test(
         lower,
       )
+    // The fallback used to return `entities: {}`, which discarded whatever the pass had
+    // already learned (a section word, a token count). Nothing here has enough evidence to
+    // name an intent, but that is no reason to throw the measurements away — a `unknown`
+    // turn still routes to a tool run that can use them.
     return {
       intent: pleasantry ? 'smalltalk' : 'unknown',
       confidence: pleasantry ? 0.5 : 0.05,
       signals: contentTokens ? [`tokens:${contentTokens}`] : ['empty'],
-      entities: {},
+      entities: { ...(contentTokens ? { tokens: contentTokens } : {}), ...(section ? { section: section.id } : {}) },
     }
   }
 
@@ -257,7 +294,7 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
 
   const entities: Record<string, string | number> = { tokens: contentTokens }
   if (projectReference) entities.project = projectReference
-  if (section) entities.section = section
+  if (section) entities.section = section.id
   if (options.hint) entities.hint = options.hint
 
   return {

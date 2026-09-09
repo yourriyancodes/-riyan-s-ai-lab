@@ -90,6 +90,10 @@ export type RavenReply = {
   /** Full brain response. */
   success: boolean
   response: string
+  /** Canonical alias of `response`, and `provider`/`degraded` are the truth about who answered. */
+  reply?: string
+  provider?: string
+  degraded?: { from: RavenMode; because: string } | null
   mode: RavenMode
   conversationId: string
   citations: RavenCitation[]
@@ -239,13 +243,17 @@ export async function askRaven(input: string, options: AskOptions = {}): Promise
     message: typeof data.message === 'string' ? data.message : undefined,
     code: typeof data.code === 'string' ? data.code : ((data.error as { code?: string } | undefined)?.code ?? undefined),
     success: Boolean(data.success),
-    response: typeof data.response === 'string' ? data.response : (data.output as string | undefined) ?? '',
+    // `response` first: it is the long-standing field. `reply` is the standardised name, and
+    // either is enough, which lets the server rename a field without stranding this client.
+    response: typeof data.response === 'string' ? data.response : (typeof data.reply === 'string' ? data.reply : (data.output as string | undefined) ?? ''),
     mode: (data.mode as RavenMode) ?? 'offline',
     conversationId: typeof data.conversationId === 'string' ? data.conversationId : (options.conversationId ?? ''),
     citations: Array.isArray(data.citations) ? (data.citations as RavenCitation[]) : [],
     actions: Array.isArray(data.actions) ? (data.actions as RavenProposedAction[]) : [],
     memoryUpdates: Array.isArray(data.memoryUpdates) ? (data.memoryUpdates as RavenReply['memoryUpdates']) : [],
     verified: Boolean(data.verified),
+    ...(typeof data.provider === 'string' ? { provider: data.provider } : {}),
+    ...(data.degraded && typeof data.degraded === 'object' ? { degraded: data.degraded as RavenReply['degraded'] } : {}),
     ...(data.error ? { error: data.error as RavenReply['error'] } : {}),
     ...(data.metadata ? { metadata: data.metadata as RavenMetadata } : {}),
   }
