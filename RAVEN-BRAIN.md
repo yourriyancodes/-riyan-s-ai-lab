@@ -23,6 +23,51 @@ runtime dependencies**: no `pg`, no ORM, no vector store, no LLM SDK, no test fr
 The console, landing page, 3D face, portfolio sections and the portrait are untouched,
 apart from two additive lines in `RavenConsole.tsx` (two more names in `WORKING_STATES`).
 
+### 1.1 Follow-up round: what driving the real system found
+
+The spec was re-checked section by section against the running server rather than against
+this document, and three defects turned up — all of them in the *classifier*, all of them
+reachable by ordinary typing, none of them visible from the unit tests that existed:
+
+1. **A capability question was answered with a pleasantry.** The unmatched-input fallback
+   tested `contentTokens <= 2` to decide "small-talk", so *"Do you have access to my
+   computer?"* (two content words: access, computer) was classified as small-talk and
+   answered `Noted. Ask me something about the portfolio…` — with `verified: true` and
+   **zero** citations, i.e. a filler ack stamped as grounded. Now a pleasantry is decided by
+   the words themselves, `capability.probe` recognises access/permission/internet/"can you
+   see" phrasings, and those questions route to `system_status`, which reports the measured
+   capability set (`Provider: none configured…`) with a real citation.
+2. **Durable memory was write-only in practice.** *"Please remember that I prefer Rust for
+   command-line tools."* stored fine; *"What language do I prefer for CLIs?"* did not match
+   `memory.recall`, so the fact sat unreachable and the turn ended in a refusal. The recall
+   patterns now cover question-shaped preference and anaphoric conversation references
+   ("did I mention…", "what did I just ask you…"), and a test asserts the round trip
+   end-to-end: store, ask, answer contains the fact.
+3. **`/api/raven` had no concurrency or integrity coverage** (spec §22 item 14). Three
+   checks now run simultaneous turns and assert the properties that matter: each turn cites
+   its own retrieval (the two knowledge turns' citation sets must be disjoint), each trace
+   stays ordered inside its own turn, four simultaneous writes to one conversation all
+   reach history as exactly four user/reply pairs with no lost row, and a repeated question
+   goes through retrieval again — which is what proves nothing is cached behind the "it
+   retrieved that" claim.
+
+Two things were **not** changed, deliberately. `no_grounding` still answers HTTP 502: it is
+a refusal *with* a body the console already handles, and turning a refusal into 200 would
+make the rate limiter and the real 502s indistinguishable in logs. And offline recall stays
+fact-based: there is no deterministic summariser over verbatim conversation history, so
+`context.recent` is sent to a provider when one exists and is not paraphrased when none
+does. Saying "I recall you asked about X" from a two-line history read would be theatre.
+
+`RavenConsole` now renders the two fields the route was already returning and nothing was
+showing: `sources` (up to four citation labels with locators) and a collapsed
+"what ran · N phases" trace built from `metadata.trace`. Both are absent, not empty, when
+the server returned nothing for them. The visual layer stayed byte-identical —
+The frozen set is verifiable rather than asserted: the only files that changed in this
+round are `components/RavenConsole.tsx`, `lib/ravenStore.ts`, `lib/raven/intent.ts`,
+`scripts/check-brain.mjs` and this document — `lib/ravenMachine.ts`, `lib/ravenStudio.ts`,
+`components/Raven3D.tsx`, `app/globals.css`, the portrait module and `lib/ravenVoice.ts`
+are byte-identical to the commit that closed the visual work.
+
 ---
 
 ## 2. Layer map
@@ -386,14 +431,44 @@ driver it fell back to. No streaming endpoint exists — replies are single JSON
 
 ---
 
+### 11.1 One log line per turn (`lib/raven/log.ts`)
+
+The route writes exactly one line per request that reaches the brain, and one per refusal —
+built from measured values, not from a second source of truth:
+
+```
+raven.turn session=rA2MFQrQ conv=lEeTwkrO via=text status=200 intent=plan.multistep conf=0.98
+  mode=agentic state=SPEAKING verified=true steps=4
+  tools=list_projects+get_skills+search_knowledge toolruns=succeeded:3
+  provider=none breaker=closed db=file mem=+0/-2 chars=42 ctx=873 degraded=genai ms=48
+raven.reject reason=empty_input status=422 ms=0
+```
+
+Three rules, each asserted in `check-backend.mjs`:
+
+- **No user text, ever.** The message never reaches stdout — the test sends a canary
+  ("passport number …") and asserts the substring is absent. Session and conversation ids
+  are hashed to 8-character tokens, so lines from one conversation can be correlated without
+  the log identifying anyone. Text belongs in the conversation store, where the user can see
+  and delete it, not in whatever aggregates a server's stdout.
+- **The log cannot drift from the wire.** The test compares the logged `mode`, `state`,
+  `verified` and `status` against the response body the client actually received, and fails
+  if any differ. A log that disagrees with the response is worse than no log, because it is
+  believed more.
+- **Severity follows the outcome.** `status >= 400` goes to `console.warn`, including a turn
+  that answered politely but ungroundedly. Nobody had to decide to be honest about it.
+
+`RAVEN_LOG=0` silences it; the backend suite sets that so its output stays readable.
+
 ## 12. Testing locally
 
 No model, no database, no network needed:
 
 ```bash
 npm run check            # typecheck + schema drift + assets + speech + face + brain + backend
-npm run check:brain      # 59 checks: states, intents, retrieval, tools, memory, drivers,
-                         #   honesty, degradation, contract hygiene
+npm run check:brain      # 65 checks: states, intents, retrieval, tools, memory, drivers,
+                         #   honesty, degradation, contract hygiene, concurrency, and the
+                         #   intent shapes the browser actually types
 npm run check:backend    # 29 checks: Gemini + OpenAI-compatible transports against a real
                          #   local HTTP server, Supabase REST over real HTTP, both routes
 npm run typecheck

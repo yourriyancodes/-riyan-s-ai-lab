@@ -380,6 +380,37 @@ export default function RavenConsole() {
                   <span>Executed: {msg.toolUsed}</span>
                 </div>
               )}
+
+              {/* Evidence, not decoration. Both blocks only exist when the server actually
+                  returned them, and they are collapsed by design: a source list you have to
+                  ask for is still a source list, while one that dominates the bubble turns
+                  the console into a debug panel again. */}
+              {msg.sources?.length ? (
+                <div className="mt-2 pt-2 border-t border-cyan-500/15 flex flex-wrap items-center gap-1">
+                  <span className="text-[10px] mono text-gray-500 mr-0.5">SOURCES</span>
+                  {msg.sources.map((source, index) => (
+                    <span
+                      key={`${source}-${index}`}
+                      className="text-[10px] mono px-1.5 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/5 text-cyan-300/90"
+                    >
+                      {source}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+
+              {msg.trace?.length ? (
+                <details className="mt-1.5">
+                  <summary className="cursor-pointer list-none text-[10px] mono text-gray-500 hover:text-cyan-300 transition-colors">
+                    what ran · {msg.trace.length} phase{msg.trace.length === 1 ? '' : 's'}
+                  </summary>
+                  <ol className="mt-1.5 space-y-0.5 pl-4 list-decimal text-[10px] mono text-gray-400/90">
+                    {msg.trace.map((line, index) => (
+                      <li key={`${line}-${index}`}>{line}</li>
+                    ))}
+                  </ol>
+                </details>
+              ) : null}
             </div>
           </div>
         ))}

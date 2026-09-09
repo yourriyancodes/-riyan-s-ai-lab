@@ -22,7 +22,27 @@ const RULES: Rule[] = [
   {
     intent: 'capability.probe',
     weight: 3,
-    patterns: [/\bwhat can you do\b/, /\byour capabilities?\b/, /\bare you (online|offline|working|up)\b/, /\bis (the )?(llm|model|backend|gemini|database|api)\b/, /\bdo you have (a )?(key|model|database)\b/, /\bwhich model\b/, /\bare you using (an )?llm\b/, /\bwhat (is your )?status\b/, /\bsystem status\b/],
+    // Questions about what RAVEN *can reach* are capability probes, not portfolio
+    // questions, and they deserve the tool that answers them with measured facts
+    // (`system_status` lists the real tool set) instead of a shrug or an invented claim.
+    patterns: [
+      /\bwhat can you do\b/,
+      /\byour capabilities?\b/,
+      /\bare you (online|offline|working|up)\b/,
+      /\bis (the )?(llm|model|backend|gemini|database|api)\b/,
+      /\bdo you have (a )?(key|model|database)\b/,
+      /\bwhich model\b/,
+      /\bare you using (an )?llm\b/,
+      /\bwhat (is your )?status\b/,
+      /\bsystem status\b/,
+      /\bdo you have (access|permission|the ability|capabilities)\b/,
+      /\baccess (to )?(my|the) (computer|machine|laptop|files?|filesystem|disk|screen|camera|microphone|shell|terminal)\b/,
+      /\bcan you (see|read|open|run|execute|browse|search|control|access|edit|delete)\b/,
+      /\b(browse|search|check|look up|fetch) (the |on |up the )?(internet|web|online|internet's)\b/,
+      /\b(internet|network|web) access\b/,
+      /\bwhat (tools|permissions|sources|data)( are| do) (you|you do)\b/,
+      /\bare you connected to\b/,
+    ],
     signals: ['capability-question'],
   },
   {
@@ -64,7 +84,31 @@ const RULES: Rule[] = [
   {
     intent: 'memory.recall',
     weight: 3.2,
-    patterns: [/\bwhat do you (remember|know about me)\b/, /\bdo you remember\b/, /\bmy (favorite|favourite|preferred) .*\b/, /\bwhat have i told you\b/, /\bmy preferences?\b/, /\brecall\b/],
+    // A recall question is phrased every way except the five patterns this used to have,
+    // and every miss was worse than a wrong guess: the memory was stored but unreachable,
+    // which is exactly the "memory that does not work" failure the whole layer exists to
+    // avoid. Anything asking what *I* prefer/said/want is a recall, term-matched against the
+    // session's own facts by `recall_memories`.
+    patterns: [
+      /\bwhat do you (remember|know about me)\b/,
+      /\bdo you remember\b/,
+      /\bmy (favorite|favourite|preferred) .*\b/,
+      /\bwhat have i told you\b/,
+      /\bmy preferences?\b/,
+      /\brecall\b/,
+      /\bwhat\b[^?!.]{0,48}\b(do|does|did) i (prefer|like|love|use|want|choose)\b/,
+      /\bwhich\b[^?!.]{0,48}\b(do|does|did) i (prefer|like|use)\b/,
+      // The object of "did I mention" is whatever the user said, so requiring one was a
+      // mistake: "did I mention a preferred language?" is the common shape and it missed.
+      /\b(do|did) i (ever )?(tell|say|mention|ask)\b/,
+      // Referring back to the conversation is a recall question whatever its exact shape —
+      // and offline it is answered from durable facts, which is what "remember" means here.
+      /\bwhat did i (just )?(ask|say|tell|mention|ask you)\b/,
+      /\bearlier\b/, /\bprevious(ly)?\b.*\bi\b/, /\b(just now|a moment ago)\b.*\bi\b/,
+      /\bremind me\b/,
+      /\bwhat (did|i) (i )?say\b/,
+      /\bmy (go-to|default|usual)\b/,
+    ],
     signals: ['recall-command'],
   },
   {
@@ -182,13 +226,22 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
 
   if (options.hint) add('portfolio.sections', 0.5, ['caller-hint'])
 
-  // Long, contentless messages are noise; keep them small-talk rather than pretending
-  // an intent was detected.
+  // Nothing matched. `smalltalk` is a claim about the *words*, not about their count: the
+  // previous test here was `contentTokens <= 2`, which silently turned every short question
+  // ("access computer", "phone number", "your price") into a pleasantry and answered it with
+  // the small-talk acknowledgement — a shrug, on a page whose whole promise is that the
+  // answers come from real data. So: only an actual pleasantry is small-talk, and everything
+  // else is `unknown`, which routes to a provider when one is configured and to an explicit
+  // "not grounded, not invented" refusal when one is not.
   const contentTokens = tokens.length
   if (!scores.size) {
+    const pleasantry =
+      /^\s*(?:thanks?|thank you|ty|ok(?:ay)?|nice|cool|great|awesome|bye|goodbye|see ya|later|lol|hmm+|yep|yeah|nope|hi|hello|hey|yo|sup|howdy|morning|evening)\b[\s!.,?]*$/i.test(
+        lower,
+      )
     return {
-      intent: contentTokens <= 2 ? 'smalltalk' : 'unknown',
-      confidence: contentTokens <= 2 ? 0.4 : 0.05,
+      intent: pleasantry ? 'smalltalk' : 'unknown',
+      confidence: pleasantry ? 0.5 : 0.05,
       signals: contentTokens ? [`tokens:${contentTokens}`] : ['empty'],
       entities: {},
     }

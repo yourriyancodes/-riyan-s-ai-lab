@@ -734,6 +734,115 @@ await check('unregistered tools are refused by the planner path too', async () =
 })
 
 // ---------------------------------------------------------------------------
+group('11. Concurrency (one process, many turns at once)')
+
+await check('concurrent turns answer their own question and never borrow each other\u2019s evidence', async () => {
+  resetDatabaseHandle()
+  const questions = [
+    { message: 'What technologies does Riyan use?', sessionId: 'ses-c1', conversationId: 'conv-c1' },
+    { message: 'What projects has Riyan built?', sessionId: 'ses-c2', conversationId: 'conv-c2' },
+    { message: 'Do you have access to my computer?', sessionId: 'ses-c3', conversationId: 'conv-c3' },
+  ]
+  const results = await Promise.all(questions.map((q) => ask(q.message, q)))
+  assert.equal(results.length, 3, 'a concurrent turn never came back')
+  for (const result of results) {
+    assert.ok((result.response ?? '').trim().length > 20, 'a concurrent turn answered with nothing')
+    // A trace is per-turn state. If turns shared a accumulator, this would interleave.
+    const at = (result.metadata?.trace ?? []).map((phase) => phase.atMs)
+    assert.ok(at.length >= 2, 'no phases recorded for a real turn')
+    assert.deepEqual([...at].sort((a, b) => a - b), at, 'a turn\u2019s phase trace arrived out of order')
+  }
+  const key = (result) => new Set((result.citations ?? []).map((citation) => JSON.stringify(citation)))
+  const skillSet = key(results[0])
+  const projectSet = key(results[1])
+  assert.ok(skillSet.size > 0 && projectSet.size > 0, 'the two knowledge turns cited nothing, so disjointness proves nothing')
+  for (const citation of projectSet) assert.ok(!skillSet.has(citation), 'two different questions were answered from the same retrieved record')
+  // And the capability probe must not act: no actions, and no claim of access.
+  assert.equal(results[2].actions.length, 0, 'a turn claimed an action for the access question')
+  assert.match(results[2].response, /no|cannot|can't|not able|don\u2019t have|do not have|never/i, 'the access question was not refused')
+})
+
+await check('simultaneous turns on one conversation all reach history, with nothing lost', async () => {
+  resetDatabaseHandle()
+  const sessionId = 'ses-shared'
+  const conversationId = 'conv-shared'
+  const messages = [
+    'Riyan prefers TypeScript for backend work.',
+    'What projects has Riyan built?',
+    'Riyan works on data engineering pipelines.',
+    'What technologies does Riyan use?',
+  ]
+  const results = await Promise.all(messages.map((message) => ask(message, { sessionId, conversationId })))
+  assert.ok(results.every((result) => (result.response ?? '').trim().length > 0), 'a turn on the shared conversation failed')
+  const handle = await getDatabase()
+  const history = await handle.adapter.recentMessages(conversationId, 100)
+  const users = history.filter((row) => row.role === 'user').map((row) => row.content)
+  const ravens = history.filter((row) => row.role === 'raven')
+  // Four turns wrote concurrently: every user line must appear exactly once, and there must
+  // be a reply for each. A lost write under interleaving would show up here as a short count.
+  for (const message of messages) {
+    assert.equal(users.filter((content) => content === message).length, 1, `shared history lost or duplicated: ${message.slice(0, 32)}`)
+  }
+  assert.equal(ravens.length, messages.length, `${ravens.length} replies for ${messages.length} turns on one conversation`)
+  assert.equal(history.length, messages.length * 2, 'conversation rows are not user/reply pairs')
+  // Both facts the user stated must have been extracted exactly once each, not twice.
+  const remembered = await handle.adapter.recallMemories(sessionId, 20)
+  const preferenceKeys = remembered.filter((memory) => /preference|profile/i.test(memory.key)).map((memory) => memory.key)
+  assert.equal(new Set(preferenceKeys).size, preferenceKeys.length, 'concurrent memory writes duplicated a fact under the same key')
+})
+
+await check('the same question twice in a row is answered from retrieval again, not from a cache', async () => {
+  resetDatabaseHandle()
+  const first = await ask('What projects has Riyan built?', { sessionId: 'ses-dup', conversationId: 'conv-dup' })
+  const second = await ask('What projects has Riyan built?', { sessionId: 'ses-dup', conversationId: 'conv-dup' })
+  assert.ok(first.metadata.trace.some((phase) => /retriev|knowledge/i.test(phase.phase)), 'the first turn never ran retrieval')
+  assert.ok(second.metadata.trace.some((phase) => /retriev|knowledge/i.test(phase.phase)), 'the repeat turn skipped retrieval, which means something is cached')
+})
+
+// ---------------------------------------------------------------------------
+group('12. Intent coverage the browser actually exercises')
+
+await check('capability questions reach system_status instead of a pleasantry', async () => {
+  for (const message of [
+    'Do you have access to my computer?',
+    'Can you read my files?',
+    'Search the internet for the newest Next.js release.',
+    'Do you have internet access?',
+  ]) {
+    assert.equal(classifyIntent(message).intent, 'capability.probe', `mis-classified: ${message}`)
+  }
+  const result = await ask('Do you have access to my computer?', { sessionId: 'ses-cap', conversationId: 'conv-cap' })
+  assert.ok(result.metadata.toolsUsed.includes('system_status'), 'the capability answer did not come from the measured status tool')
+  assert.ok((result.citations ?? []).length > 0, 'a capability answer shipped with no evidence')
+  assert.match(result.response, /no|not|cannot|can't|never|only/i, 'the capability answer did not state its limits')
+  assert.equal(result.actions.length, 0, 'a capability probe caused an action')
+})
+
+await check('a stored preference is actually findable with a natural question', async () => {
+  resetDatabaseHandle()
+  assert.equal(classifyIntent('What language do I prefer for CLIs?').intent, 'memory.recall', 'recall question never reached the recall intent')
+  assert.equal(classifyIntent('What did I just ask you to remember?').intent, 'memory.recall', 'a conversation reference is a recall question')
+  assert.equal(classifyIntent('Did I mention a preferred language?').intent, 'memory.recall', 'an anaphoric recall question was missed')
+  const sessionId = 'ses-pref'
+  const conversationId = 'conv-pref'
+  const stored = await ask('Please remember that I prefer Rust for command-line tools.', { sessionId, conversationId })
+  assert.ok(stored.memoryUpdates.length > 0, `nothing was stored: ${stored.response.slice(0, 120)}`)
+  const recall = await ask('What language do I prefer for CLIs?', { sessionId, conversationId })
+  assert.match(recall.response, /Rust/, `the fact was stored but never recalled — answer was: ${recall.response.slice(0, 160)}`)
+  assert.ok(recall.metadata.toolsUsed.includes('recall_memories'), 'recall did not read the memory store')
+})
+
+await check('short unmatched questions are \u201cunknown\u201d, not silently small-talk', async () => {
+  assert.equal(classifyIntent('phone number').intent, 'unknown', 'a two-word question was absorbed as small-talk again')
+  assert.equal(classifyIntent('access computer').intent, 'unknown')
+  assert.equal(classifyIntent('thanks').intent, 'smalltalk', 'a real pleasantry must still be recognised as one')
+  assert.equal(classifyIntent('Thank you!').intent, 'smalltalk')
+  const refused = await ask('What is my bank balance?', { sessionId: 'ses-un', conversationId: 'conv-un' })
+  assert.equal(refused.success, false, 'an ungroundable question claimed success')
+  assert.match(refused.response, /invent|ground/i, 'the refusal did not say it refused to invent')
+})
+
+// ---------------------------------------------------------------------------
 const total = passed + failures.length
 console.log(`\n${failures.length ? '\u001b[31m' : '\u001b[32m'}${passed}/${total} checks passed\u001b[0m`)
 if (failures.length) {

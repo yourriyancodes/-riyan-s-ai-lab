@@ -22,6 +22,9 @@ delete process.env.DATABASE_URL
 delete process.env.SUPABASE_URL
 delete process.env.SUPABASE_DB_KEY
 process.env.RAVEN_RATE_MAX = '1000'
+// Quiet by default: the suite drives the real route handlers, so one log line per request
+// would bury the PASS list. The logging case below switches it on for exactly one turn.
+process.env.RAVEN_LOG = '0'
 
 const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 
@@ -311,6 +314,52 @@ await check('POST /api/raven answers a knowledge question and labels the mode', 
   assert.ok(Array.isArray(data.metadata.trace) && data.metadata.trace.length >= 4)
   assert.equal(typeof data.metadata.latencyMs, 'number')
   assert.equal(data.verified, true)
+})
+
+await check('a turn logs one measured line, and never the user\u2019s words', async () => {
+  resetRateLimiter()
+  process.env.RAVEN_LOG = '1'
+  const lines = []
+  const realInfo = console.info
+  const realWarn = console.warn
+  console.info = (...args) => lines.push(['info', args.join(' ')])
+  console.warn = (...args) => lines.push(['warn', args.join(' ')])
+  let answeredBody = null
+  let answeredStatus = 0
+  try {
+    // The "question" doubles as a canary: anything it contains must never reach stdout.
+    const answered = await ravenRoute.POST(post({ message: 'my passport number is 4471-2299-0011, what is riyan doing', conversationId: 'conv-log-1', sessionId: 'ses-log-1' }))
+    answeredStatus = answered.status
+    answeredBody = await answered.json()
+    const rejected = await ravenRoute.POST(post({ message: '   ', conversationId: 'conv-log-1', sessionId: 'ses-log-1' }))
+    assert.equal(rejected.status, 422)
+  } finally {
+    console.info = realInfo
+    console.warn = realWarn
+    process.env.RAVEN_LOG = '0'
+  }
+  const turns = lines.filter(([, text]) => text.startsWith('raven.turn '))
+  const rejects = lines.filter(([, text]) => text.startsWith('raven.reject '))
+  assert.equal(turns.length, 1, `expected exactly one turn line, saw ${turns.length}`)
+  assert.equal(rejects.length, 1, 'a rejected request must also leave a trace')
+  const [level, turnLine] = turns[0]
+  for (const field of ['session=', 'conv=', 'status=', 'intent=', 'mode=', 'ms=']) {
+    assert.ok(turnLine.includes(field), `turn line is missing ${field}: ${turnLine}`)
+  }
+  // Privacy, asserted rather than promised.
+  for (const leak of ['passport', '4471', '2299', 'ses-log-1', 'conv-log-1']) {
+    assert.ok(!turnLine.includes(leak), `the log leaked ${leak}`)
+    assert.ok(!rejects[0][1].includes(leak), `the rejection line leaked ${leak}`)
+  }
+  assert.match(rejects[0][1], /reason=empty_input status=422/, `unexpected rejection line: ${rejects[0][1]}`)
+  // The line and the wire must say the same thing. A log that drifts from the response is
+  // worse than no log, because it is believed more.
+  const field = (name) => (turnLine.match(new RegExp(`${name}=(\\S+)`)) ?? [])[1]
+  assert.equal(field('mode'), answeredBody.mode, `logged mode ${field('mode')} != wire mode ${answeredBody.mode}`)
+  assert.equal(field('state'), answeredBody.state, 'logged state does not match the state the client was told')
+  assert.equal(field('status'), String(answeredStatus), 'the logged status is not the status that was sent')
+  assert.equal(field('verified'), String(answeredBody.verified), 'verified is logged differently from how it is answered')
+  assert.equal(level, answeredStatus >= 400 ? 'warn' : 'info', 'log severity must follow the outcome')
 })
 
 await check('a bad conversation id is replaced rather than trusted', async () => {

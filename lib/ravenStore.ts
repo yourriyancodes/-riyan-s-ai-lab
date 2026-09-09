@@ -30,6 +30,18 @@ type ChatMessage = {
   text: string
   timestamp: string
   toolUsed?: string
+  /**
+   * What the answer was built from, straight off the server's own citation list. Kept as
+   * plain strings because a transcript renders text, not a debug tree; the structured form
+   * stays on `RavenReply.citations` for anything that needs kinds and locators.
+   */
+  sources?: string[]
+  /**
+   * The server's phase trace for this turn, one short line per phase that actually ran.
+   * Backend events with real timings — not chain-of-thought: the brain reports what it
+   * did, never how it deliberated.
+   */
+  trace?: string[]
 }
 
 /** Compile-time guard: siteConfig's state list must stay in sync with the API union. */
@@ -199,6 +211,8 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
 
     let replyText = ''
     let toolUsed: string | undefined
+    let sources: string[] | undefined
+    let trace: string[] | undefined
     let failed = false
 
     try {
@@ -230,6 +244,18 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
       toolUsed = [prefix, tools.length ? tools.join(' + ') : null, notes.length ? notes.join(', ') : null]
         .filter(Boolean)
         .join(' · ')
+
+      // Both lists are assembled from fields the route already returns, so there is nothing
+      // here to fabricate a busy-looking turn: if retrieval found nothing, `sources` stays
+      // empty and the console draws no source line at all.
+      const cited = (result.citations ?? []).slice(0, 4).map((citation) =>
+        citation.locator ? `${citation.label} · ${citation.locator}` : citation.label,
+      )
+      const phases = (result.metadata?.trace ?? []).map(
+        (phase) => `${phase.phase}${phase.ms ? ` · ${phase.ms} ms` : ''}${phase.note ? ` — ${phase.note}` : ''}`,
+      )
+      sources = cited.length ? cited : undefined
+      trace = phases.length ? phases : undefined
 
       replyText = (result.output || result.response || '').trim()
 
@@ -282,7 +308,7 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
     }
 
     setState('SPEAKING')
-    addMessage({ sender: 'raven', text: replyText, toolUsed })
+    addMessage({ sender: 'raven', text: replyText, toolUsed, sources, trace })
 
     const settle = () => {
       get().setIsSpeaking(false)

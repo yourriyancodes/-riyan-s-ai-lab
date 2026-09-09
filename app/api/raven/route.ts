@@ -9,6 +9,7 @@
  * client never has to branch on a body shape before it can show something.
  */
 import { runBrainTurn, providerBreakerState } from '@/lib/raven/brain'
+import { logRejection, logTurn } from '@/lib/raven/log'
 import { ravenConfig } from '@/lib/raven/config'
 import { checkRateLimit } from '@/lib/raven/rateLimit'
 import { resolveSession } from '@/lib/raven/session'
@@ -50,29 +51,44 @@ export async function POST(request: Request): Promise<Response> {
   const config = ravenConfig()
   const startedAt = Date.now()
 
+  // Every early return goes through here so a refusal is on the record too: "the console is
+  // misbehaving" and "the limiter is on" are different incidents, and only the log can tell
+  // them apart after the fact. The body of the reply is unchanged.
+  const reject = (message: string, code: string, status: number, extra: Record<string, unknown> = {}, headers: Record<string, string> = {}) => {
+    logRejection(code, status, startedAt, typeof extra.retryAfterMs === 'number' ? `retry-after=${Math.ceil(extra.retryAfterMs / 1000)}s` : undefined)
+    const { conversationId, ...rest } = extra
+    return json(rejection(message, typeof conversationId === 'string' ? conversationId : 'none', code, rest), status, headers)
+  }
+
   const declared = Number.parseInt(request.headers.get('content-length') ?? '', 10)
   if (Number.isFinite(declared) && declared > config.limits.maxBodyBytes) {
-    return json(rejection(`Request body is ${declared} bytes; the limit is ${config.limits.maxBodyBytes}.`, 'none', 'body_too_large'), 413)
+    return reject(`Request body is ${declared} bytes; the limit is ${config.limits.maxBodyBytes}.`, 'body_too_large', 413)
   }
 
   let payload: unknown
   try {
     payload = await request.json()
   } catch {
-    return json(rejection('Body must be valid JSON.', 'none', 'invalid_json'), 400)
+    return reject('Body must be valid JSON.', 'invalid_json', 400)
   }
-  if (!payload || typeof payload !== 'object') return json(rejection('Body must be a JSON object.', 'none', 'invalid_json'), 400)
+  if (!payload || typeof payload !== 'object') return reject('Body must be a JSON object.', 'invalid_json', 400)
   const body = payload as Record<string, unknown>
 
   const rate = checkRateLimit(clientKey(request), config.limits.rateLimit)
   if (!rate.allowed) {
-    return json(rejection(`Slow down: ${rate.used} requests in the last ${Math.round(config.limits.rateLimit.windowMs / 1000)}s (limit ${rate.limit}).`, String(body.conversationId ?? 'none'), 'rate_limited', { retryAfterMs: rate.retryAfterMs }), 429, { 'retry-after': String(Math.ceil(rate.retryAfterMs / 1000)) })
+    return reject(
+      `Slow down: ${rate.used} requests in the last ${Math.round(config.limits.rateLimit.windowMs / 1000)}s (limit ${rate.limit}).`,
+      'rate_limited',
+      429,
+      { retryAfterMs: rate.retryAfterMs, conversationId: String(body.conversationId ?? 'none') },
+      { 'retry-after': String(Math.ceil(rate.retryAfterMs / 1000)) },
+    )
   }
 
   const message = typeof body.message === 'string' ? body.message : ''
-  if (!message.trim()) return json(rejection('A message is required.', String(body.conversationId ?? 'none'), 'empty_input'), 422)
+  if (!message.trim()) return reject('A message is required.', 'empty_input', 422)
   if (message.length > config.limits.maxMessageChars) {
-    return json(rejection(`Message is ${message.length} characters; the limit is ${config.limits.maxMessageChars}.`, String(body.conversationId ?? 'none'), 'too_long'), 413)
+    return reject(`Message is ${message.length} characters; the limit is ${config.limits.maxMessageChars}.`, 'too_long', 413)
   }
 
   const context = (body.context && typeof body.context === 'object' ? body.context : {}) as Record<string, unknown>
@@ -114,6 +130,40 @@ export async function POST(request: Request): Promise<Response> {
   if (session.issuedCookie) headers['set-cookie'] = `${session.issuedCookie}`
   if (result.error?.retryAfterMs) headers['retry-after'] = String(Math.ceil(result.error.retryAfterMs / 1000))
   if (result.metadata) headers['x-raven-breaker'] = providerBreakerState().open ? 'open' : 'closed'
+
+  // One line for the turn that actually ran. Status first, then the decisions: what the
+  // classifier thought, which mode answered, which tools ran with what outcomes, whether a
+  // provider was involved or tripped its breaker, and how long it took.
+  const metadata = result.metadata
+  const toolStatuses = metadata?.toolRuns.reduce<Record<string, number>>((counts, run) => {
+    counts[run.status] = (counts[run.status] ?? 0) + 1
+    return counts
+  }, {})
+  logTurn({
+    status: result.success ? 200 : 502,
+    sessionId: session.sessionId,
+    conversationId,
+    inputType,
+    intent: metadata?.intent,
+    intentConfidence: metadata?.intentConfidence,
+    mode: result.mode,
+    state: result.state,
+    verified: result.verified,
+    steps: metadata?.steps,
+    toolsUsed: metadata?.toolsUsed,
+    toolStatuses,
+    provider: metadata?.provider?.id ?? null,
+    breakerOpen: providerBreakerState().open,
+    dbDriver: metadata?.database.driver,
+    memoryRetrieved: metadata?.memory.retrieved,
+    memoryStored: metadata?.memory.stored,
+    latencyMs: Date.now() - startedAt,
+    inputChars: metadata?.inputChars,
+    contextChars: metadata?.contextChars,
+    truncated: metadata?.truncated,
+    degradedFrom: metadata?.route.degradedFrom,
+    errorCode: result.error?.code,
+  })
 
   return json(result, result.success ? 200 : 502, headers)
 }
