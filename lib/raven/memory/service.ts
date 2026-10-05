@@ -9,6 +9,7 @@
  * Both are best-effort by design: every path here swallows adapter failures into
  * `errors`, because losing memory must downgrade the answer, never break it.
  */
+import { deriveMemoryKind } from './kind'
 import type { ConversationMessageRecord, DatabaseAdapter, MemoryRecord, MemoryUpdate, RavenMode, RavenState, DatabaseDriver } from '../types'
 import { tokenize } from '../knowledge/search'
 
@@ -155,6 +156,7 @@ export async function storeTurn(turn: TurnToStore): Promise<StoreResult> {
           createdAt: turn.now,
           updatedAt: turn.now,
           source: 'extracted',
+          kind: deriveMemoryKind(update.key, update.value ?? ''),
         })
         stored++
       } catch (error) {

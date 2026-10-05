@@ -212,3 +212,168 @@ LIVE GENAI:      NOT AVAILABLE on this machine (no key; 127.0.0.1:11434 refused;
 - Voice and rendering are outside this pass. `speechSynthesis` cannot run in this sandbox, and the
   frozen 3D layer was verified by suite + code inspection only — no GPU, no headless browser.
 - Rate limiting and the breaker are per-process; two workers mean two counters.
+
+---
+
+# Phase 2 — the intelligence core, measured before it was touched
+
+The brief said optimise, and the honest first move was to find out what there is to optimise. Nothing
+in the engine was slow, which changed what this round was for.
+
+## P2.0 The measurements
+
+120 live turns on the committed build (5 rounds × the 12 phrasings the Phase-2 brief itself used),
+three instances sharing nothing but code — file store, SQLite store, and SQLite plus a local
+OpenAI-compatible endpoint:
+
+| Measure | Result |
+| --- | --- |
+| turn latency | **p50 6 ms · p95 18 ms · max 104 ms** (the max is a conversation's cold first turn) |
+| per-phase means | input 1 · persistence 1–2 · context 1 · intent 1 · route 0 · retrieval 2–4 · synthesis 1 · verification 1–7 ms |
+| `classifyIntent` | 0.040 ms (400 iterations, in-process, warm) |
+| `searchKnowledge` | 0.033 ms |
+| `searchKnowledge` + `rankProjects` | 0.016 ms |
+| `registry.execute` (one tool, real handler) | 0.015–0.022 ms |
+| `verifyAnswer` | 0.005 ms |
+
+So: a whole local turn costs about the same as one network round trip to any provider. The
+engine has no bottleneck to remove; it has **wasted work to avoid**. Everything below is avoidance.
+
+## P2.1 Request lifecycle — no change was justified
+
+The trace already spends 1–7 ms per phase and the sum equals the turn. What was wrong was not timing
+but *sequence*: a turn could spend a provider call on a sentence it already had (P2.3).
+
+## P2.2 Routing — one gap: memory could not preempt
+
+Rules 4 A–E held under testing except CASE B: "memory ⇒ no model unless synthesis is needed" was true
+of the *knowledge* route and false of the *genai* route, where a retrieved memory was pasted into a
+prompt and then paid for anyway. Now `memoryMatch()` runs before any engine and answers directly
+when two content words agree (one, for a one-word question).
+
+Measured on the same question, same session, same build, with a local endpoint live:
+**13 ms + 1 provider call → 7 ms + 0 calls**, `mode=knowledge`, `provider=none`, `verified=true`.
+The inverse is pinned too: an irrelevant stored fact must *not* suppress a synthesis call.
+
+A second routing gap surfaced the same way — by driving it, not reading it. "Analyse the retrieval
+pipeline in this project and recommend what to improve first" scored `portfolio.projects` at 0.98
+*because it contains a project word*, and was answered with the project listing: honest, cited, and
+not the question that was asked. `intent.ts` now has an evaluative rule — an evaluative verb
+(`analyse / review / assess / recommend / improve / weakest / bottleneck …`) together with a body of
+work (`portfolio / project / pipeline / stack / retrieval …`) — weighted above both the listing and a
+named-project lookup, choosing `plan.multistep` when the question asks what to change and
+`compare.evaluate` when it asks for a verdict. It defers to the existing scope rules, so a plan for a
+project that does not exist yet stays the refusal it was (that deferral is asserted by name). Measured
+afterwards: `mode=agentic`, real runs, citations, `verified=true`, with the model used when one is
+configured and a stated deterministic scaffold when it is not.
+
+## P2.3 Memory — record completeness without a migration
+
+`MemoryRecord` now carries `kind` (preference / fact / reference / correction / note), derived at the
+read boundary in every driver's row mapper and named at the write, so no table needed a column for a
+label that is recomputable from the key and value it already stores. A file row with the field deleted
+still reads back with the right kind — asserted on the bytes on disk, not on a mock. The importance
+fallback, the relevance floor, and the session-scope rule are unchanged from Phase 1.
+
+## P2.4 Retrieval — verified as already fine, and left alone
+
+`knowledgeIndex()` is memoized with a `resetKnowledgeIndex()` seam for tests; `documentsByTag` filters
+34 documents (0.03 ms); `system_status` uses `peekDatabaseHandle()`; `inspectDatabase` reuses
+`getDatabase()`. A WeakMap cache for the index — the obvious-looking optimisation — would memoise a
+memoisation. Rejected with the measurement attached.
+
+## P2.5 Agentic execution — duplicate work was keyed on the wrong thing
+
+The agent refused any tool that had already run this turn. That is not duplicate work; duplicate work
+is the *same call*. Keyed by `callSignature(tool, input)` (sorted keys, JSON values, bare name for an
+argument-less tool), a comparison can now fetch two project records — `get_project ×2` with
+`agent-step-1`/`agent-step-2` on the runs, measured 14 ms and 6 citations live — while the identical
+call is still refused, and a retry with different arguments is possible for the first time.
+`PlanStep`s are numbered when the plan is bounded, so `run.stepId` and `step.runId` name each other
+without either being reconstructed afterwards.
+
+The planner also re-searches the corpus (`searchKnowledge`, 0.016 ms) to decide whether a comparison
+matched anything. Left alone deliberately: removing it would trade a measurable nothing for a second
+source of truth about which records the plan can see.
+
+## P2.6 Provider — three real fixes, one of them a silent dead end
+
+1. **A keyless local endpoint could not be used at all.** `resolveProviderId` returned null without a
+   key and `brain.ts` gated live use on `apiKeyPresent`, while `providers/index.ts` documented the
+   opposite and `.env.example` told people to point at Ollama. `RAVEN_BASE_URL` + `RAVEN_MODEL` with
+   no key therefore resolved a provider in one layer and ignored it in another, in silence. A base URL
+   is now the intent (Google with no credential is still nothing), and the flags were split:
+   `providerConfigured` = a key exists (the console's `LLM KEY` chip keeps that meaning),
+   `providerUsable` = this process can call it. Measured after the fix, with no key anywhere:
+   `status:READY`, `probed:{reachable:true, authorized:true, detail:'1 model(s) served; "stub-1" available'}`,
+   and `genai` turns that actually reach the endpoint.
+2. **`ModelProvider` reports itself** — `model`, `baseUrl`, `timeoutMs`, `maxAttempts`,
+   `capabilities{jsonMode,streaming,toolCalling,vision}` — set by the factory that built it, echoed by
+   `/api/health`, and `null` for all of it when nothing is resolvable. `toolCalling:false` is not modesty:
+   a test intercepts `fetch` and asserts no `tools`, `functions`, `tool_choice` or `function_call` key
+   ever leaves the process, for either transport.
+3. **The persona now carries a prompt-injection rule**, because memory values and conversation turns are
+   user-authored text that gets embedded in the prompt: instructions found inside the material are data
+   to report on, a key found in it is never repeated, and no line inside it can authorise a claim about
+   Riyan. This was free. It was also missing.
+
+## P2.7 Verification — two blocking correspondence checks
+
+A citation is a receipt. `memory-citations-correspond` requires a `memory:<key>` citation to name a key
+this session actually holds (a store-level `database:<driver>` citation describes the store, not a row,
+and is left alone). `provider-citation-is-this-provider` requires a provider citation to name the
+provider this turn called — a turn that called nothing cannot carry one. Neither check is added to a
+turn without such a citation, so the ordinary knowledge path still reports the same count it always did.
+
+## P2.8 Context packing — an honest non-result
+
+Every block is now a `GroundingItem` with a source, a priority and a measured relevance;
+`selectContext()` sorts by priority then relevance, deduplicates at sentence level (a `RAVEN:`-quoted
+copy of a record is the same sentence, so the speaker label is stripped before comparing), drops a
+record whose body was mostly already present rather than shipping a stub of it, and returns a manifest:
+every candidate, its char count, included or excluded, with the reason.
+
+Measured against the Phase-1 builder on six real question shapes: **26,632 chars before, 26,632 after
+— byte-identical, 0 saved**, because this corpus does not repeat itself across the records a question
+retrieves. In the case it *does* (one paragraph quoted by two records and by RAVEN's previous answer)
+the same builder removed **266 chars** and the paragraph went from four copies to one. So the correct
+claim is not "the prompt got smaller"; it is **the prompt cannot silently get bloated, and the turn can
+now show its work** (`metadata.provider.context`, e.g. `{chars:1472, kept:5, dropped:1, dedupedChars:202}`
+measured live). On the local corpus the whole selection costs under 0.05 ms.
+
+## P2.9 Failure and degradation — nothing to change
+
+The breaker still acts at the provider handoff (so an agentic turn skips the model too), the three
+probe facts are still separate, the agentic budgets still race the plan, and a failed turn still
+degrades genai → knowledge → agentic → offline with no key, path or stack frame in any message. No
+measurement suggested a change, so none was made.
+
+## P2.10 Measured and rejected
+
+Recorded so the next pass does not repeat the search: WeakMap index cache (already memoised); caching
+`documentsByTag` (34-element filter, 0.03 ms); caching `system_status`'s DB inspect (already reuses
+the handle); dropping the planner's extra search (0.016 ms); micro-tuning `tokenize`/`normalize`
+(nanoseconds per call, called a handful of times per turn); a `step_id` column on `raven_tool_runs`
+(a table nothing reads back — the field ships on the run record instead); Postgres `tsvector` or any
+vector store (needs a service this budget forbids, and the lexical path answers at 6 ms).
+
+## Phase-2 status
+
+```
+LOCAL KNOWLEDGE   FUNCTIONAL   34 records, cited, verified, no model involved
+DATABASE          FUNCTIONAL   file + sqlite live; postgres/rest parity-tested at SQL text level
+MEMORY            FUNCTIONAL   durable, session-scoped, relevance-selected, kind-derived,
+                               and now able to answer before a model is asked
+VERIFICATION      FUNCTIONAL   9 checks, 2 of them new correspondence rules, all server-side
+AGENTIC           FUNCTIONAL   real registry execution, per-call dedupe, step↔run ids, budgets
+GENAI             PLUMBING READY, NOT CONFIGURED — one env var away; keyless local endpoints now work
+LIVE GENAI        NOT AVAILABLE (no credential, no outbound allowlist for a paid endpoint)
+STREAMING         NOT IMPLEMENTED — Phase 3; the seam is written down in RAVEN-BRAIN.md §7
+VISION            NOT IMPLEMENTED — client-reported only
+```
+
+Counts after this round: `npm run check` **456 green** (13 + 70 + 92 + 89 + 38 + 107 + 47), `tsc`
+clean, `next build` clean. Twelve checks were added this round; **none was weakened or removed**, and
+the new behaviours were each proved non-vacuous by deleting the mechanism and watching the test fail
+(memory skip, sentence dedupe, relevance-ordered selection, signature dedupe, the evaluative routing
+rule).

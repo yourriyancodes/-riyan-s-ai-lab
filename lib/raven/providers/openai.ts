@@ -48,6 +48,14 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
   return {
     id: 'openai',
     label: `OpenAI-compatible endpoint (${base})`,
+    model: options.model,
+    baseUrl: base,
+    timeoutMs: options.timeoutMs,
+    maxAttempts: (options.maxRetries ?? 0) + 1,
+    // `jsonMode` reflects what this client sends (`response_format`), not what the server promises:
+    // a vLLM or Ollama endpoint may ignore it, and the verifier, not the flag, is what protects the
+    // answer. Vision and tool calling are not implemented in this code path at all.
+    capabilities: { jsonMode: Boolean(options.supportJsonMode), streaming: false, toolCalling: false, vision: false },
     async probe() {
       if (probeCache && Date.now() - probeCache.at < PROBE_TTL_MS) return probeCache.value
       const response = await requestJson({ url: `${base}/models`, method: 'GET', headers, timeoutMs: Math.min(options.timeoutMs, 8000), sleep: options.sleep })

@@ -33,6 +33,7 @@
  * older runtime cannot `import('node:sqlite')`, `resolveDatabase()` downgrades with a
  * written reason instead of failing the boot.
  */
+import { withMemoryKind } from '../memory/kind'
 import type {
   AgentRunRecord,
   ConversationMessageRecord,
@@ -144,7 +145,7 @@ export async function createSqliteDatabase(options: SqliteOptions): Promise<Data
     state: (row.state as ConversationMessageRecord['state']) ?? null,
     createdAt: toIso(row.created_at),
   })
-  const mapMemory = (row: Record<string, unknown>): MemoryRecord => ({
+  const mapMemory = (row: Record<string, unknown>): MemoryRecord => withMemoryKind({
     id: String(row.id),
     sessionId: String(row.session_id),
     key: String(row.key),

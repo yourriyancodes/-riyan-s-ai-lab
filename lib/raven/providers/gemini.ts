@@ -52,6 +52,14 @@ export function createGeminiProvider(options: GeminiOptions): ModelProvider {
   return {
     id: 'gemini',
     label: 'Google Gemini (Developer API)',
+    model: options.model,
+    baseUrl: options.baseUrl,
+    timeoutMs: options.timeoutMs,
+    maxAttempts: (options.maxRetries ?? 0) + 1,
+    // JSON mode is implemented here (responseMimeType), streaming and tool calling are not wired in
+    // this application, and no image part is ever sent, so vision is reported false rather than
+    // "the model could probably do it".
+    capabilities: { jsonMode: true, streaming: false, toolCalling: false, vision: false },
     async probe() {
       if (probeCache && Date.now() - probeCache.at < PROBE_TTL_MS) return probeCache.value
       const response = await requestJson({ url: url('/models'), method: 'GET', headers, timeoutMs: Math.min(options.timeoutMs, 8000), sleep: options.sleep })

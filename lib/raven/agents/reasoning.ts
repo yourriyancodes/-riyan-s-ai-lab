@@ -16,6 +16,7 @@ import type { Citation, ConversationMessageRecord, IntentMatch, MemoryRecord, Pr
 import type { RavenConfig } from '../config'
 import type { ModelProvider } from '../types'
 import type { RetrievalResult } from './research'
+import { callSignature } from '../tools/registry'
 import type { ToolContext, ToolRegistry } from '../tools/registry'
 import { buildMessages, cleanReply, extractJsonObject } from '../providers/prompt'
 import type { GroundingInput } from '../providers/prompt'
@@ -23,7 +24,13 @@ import type { RetrievedDocument } from '../knowledge'
 import { searchKnowledge } from '../knowledge'
 import { pick } from './research'
 
-export type PlanStep = { tool: string; input: Record<string, unknown>; action?: string }
+export type PlanStep = {
+  /** Assigned when the plan is bounded, so a step can be named by the run it produced. */
+  id?: string
+  tool: string
+  input: Record<string, unknown>
+  action?: string
+}
 
 export type AgenticInput = {
   message: string
@@ -43,11 +50,14 @@ export type AgenticResult = {
   goal: string
   answer: string
   citations: Citation[]
-  steps: { action: string; tool?: string; status: ToolRun['status']; ms: number; note?: string }[]
+  /** `AgentStep`-shaped: `id` names the plan step, `runId` the persisted run that served it. */
+  steps: { id?: string; runId?: string; action: string; tool?: string; status: ToolRun['status']; ms: number; note?: string }[]
   runs: ToolRun[]
   toolsUsed: string[]
   synthesizedBy: 'provider' | 'deterministic'
   provider: { id: string; label: string; model: string; ms: number } | null
+  /** What the packed prompt actually contained, so "the model was not told X" is checkable. */
+  providerContext?: { chars: number; kept: number; dropped: number; dedupedChars: number }
   providerFailure: { code: string; message: string } | null
   evidence: EvidenceDocument[]
 }
@@ -100,7 +110,7 @@ export function planAgentSteps(input: { intent: IntentMatch; message: string; al
   const steps: PlanStep[] = []
   const notes: string[] = []
   const want = (step: PlanStep, why: string) => {
-    if (input.alreadyRan.has(step.tool)) {
+    if (input.alreadyRan.has(callSignature(step.tool, step.input))) {
       notes.push(`skipped ${step.tool}: already executed this turn (${why})`)
       return
     }
@@ -127,7 +137,13 @@ export function planAgentSteps(input: { intent: IntentMatch; message: string; al
     want({ tool: 'search_knowledge', input: { query: input.message.slice(0, 200), limit: 4 } }, 'retrieval found nothing usable; widen the search before answering')
   }
 
-  return { steps: steps.slice(0, 8), notes }
+  // Numbered after the ceiling is applied, never before: the ids have to describe the steps that
+  // actually run, so `run.stepId` and `step.runId` point at each other in the same turn.
+  const bounded = steps.slice(0, 8)
+  bounded.forEach((step, index) => {
+    step.id = `agent-step-${index + 1}`
+  })
+  return { steps: bounded, notes }
 }
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text)
@@ -143,7 +159,7 @@ export async function synthesizeWithProvider(input: {
   task: string
   json?: boolean
   mode: RavenMode
-}): Promise<{ result: ProviderResult; promptChars: number } | null> {
+}): Promise<{ result: ProviderResult; promptChars: number; contextReport: { chars: number; kept: number; dropped: number; dedupedChars: number } } | null> {
   if (!input.provider) return null
   const sources: RetrievedDocument[] = input.evidence.map((document) => ({
     id: document.id,
@@ -165,38 +181,49 @@ export async function synthesizeWithProvider(input: {
     ...(input.json === undefined ? {} : { requireJson: input.json }),
   }
   const built = buildMessages(grounding, input.config.limits.contextCharBudget)
+  const contextReport = { chars: built.usedChars, kept: built.manifest.filter((entry) => entry.included).length, dropped: built.droppedCount, dedupedChars: built.dedupedChars }
   const outcome = await input.provider.generate({
     messages: [{ role: 'system', content: built.system }, ...built.messages],
     temperature: input.config.provider.temperature,
     maxOutputTokens: input.config.provider.maxOutputTokens,
     ...(input.json ? { json: true } : {}),
   })
-  return { result: outcome, promptChars: built.usedChars }
+  return { result: outcome, promptChars: built.usedChars, contextReport }
 }
 
 export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult> {
   const goal = `Answer "${clip(input.message, 110)}" using only retrieved portfolio evidence`
+  let synthesisContext: NonNullable<AgenticResult['providerContext']> | null = null
   const steps: AgenticResult['steps'] = []
   const runs: ToolRun[] = [...input.retrieval.runs]
   const citations: Citation[] = [...input.retrieval.citations]
   const toolsUsed = new Set<string>([...input.retrieval.outcomes.keys()].map((key) => key.split('#')[0]!))
 
-  const alreadyRan = new Set(toolsUsed)
+  // Signatures, not names: retrieval already ran `get_project` for *one* reference and a
+  // comparison needs a second with a different one. What stays blocked is the identical call.
+  const alreadyRan = new Set<string>(input.retrieval.signatures ?? [...input.retrieval.outcomes.keys()].map((key) => key.split('#')[0]!))
   const plan = planAgentSteps({ intent: input.intent, message: input.message, alreadyRan })
   const maxSteps = input.config.limits.agentMaxSteps
 
   for (const step of plan.steps.slice(0, maxSteps)) {
     const started = Date.now()
     if (!input.registry.has(step.tool)) {
-      steps.push({ action: step.action ?? `call ${step.tool}`, tool: step.tool, status: 'rejected', ms: Date.now() - started, note: 'tool is not registered' })
+      steps.push({ ...(step.id ? { id: step.id } : {}), action: step.action ?? `call ${step.tool}`, tool: step.tool, status: 'rejected', ms: Date.now() - started, note: 'tool is not registered' })
       continue
     }
+    // The context carries the step id while this one call runs, so the persisted run can name the
+    // step it served — and the step can name the run back. Neither id is reconstructed afterwards.
+    input.context.stepId = step.id ?? null
     const outcome = await input.registry.execute({ tool: step.tool, input: step.input }, input.context)
+    input.context.stepId = null
+    alreadyRan.add(callSignature(step.tool, step.input))
     runs.push(outcome.run)
     input.onRun?.(outcome.run)
     toolsUsed.add(step.tool)
     if (outcome.citations?.length) citations.push(...outcome.citations)
     steps.push({
+      ...(step.id ? { id: step.id } : {}),
+      runId: outcome.run.id,
       action: `${step.tool} for ${clip(Object.values(step.input)[0] === undefined ? 'portfolio evidence' : String(Object.values(step.input)[0]), 40)}`,
       tool: step.tool,
       status: outcome.status,
@@ -233,7 +260,8 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
     })
     const started = Date.now()
     if (synthesis) {
-      const result = synthesis.result
+      synthesisContext = synthesis.contextReport
+    const result = synthesis.result
       if (result.ok) {
         const parsed = extractJsonObject(result.text)
         const candidate = typeof parsed?.answer === 'string' ? parsed.answer : result.text
@@ -241,7 +269,7 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
         provider = { id: result.provider, label: input.provider.label, model: result.model, ms: result.ms }
         synthesizedBy = 'provider'
         citations.push({ kind: 'provider', source: `provider:${result.provider}/${result.model}`, label: 'Model synthesis over the retrieved evidence', quote: clip(answer ?? '', 300) })
-        steps.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms || Date.now() - started, note: `${result.provider}/${result.model}, prompt ${synthesis.promptChars} chars` })
+        steps.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms || Date.now() - started, note: `${result.provider}/${result.model}, prompt ${synthesis.promptChars} chars${synthesis.contextReport.dedupedChars ? `, ${synthesis.contextReport.dedupedChars} duplicate chars removed` : ''}${synthesis.contextReport.dropped ? `, ${synthesis.contextReport.dropped} item(s) over budget` : ''}` })
       } else {
         providerFailure = { code: result.code, message: clip(result.message, 220) }
         steps.push({ action: 'synthesize with provider', status: 'failed', ms: result.ms || Date.now() - started, note: `${result.code}: ${clip(result.message, 140)}` })
@@ -264,6 +292,7 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
     provider,
     providerFailure,
     evidence,
+    ...(synthesisContext ? { providerContext: synthesisContext } : {}),
   }
 }
 

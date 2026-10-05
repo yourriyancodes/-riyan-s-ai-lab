@@ -233,6 +233,79 @@ of bug as the two timeout budgets that were documented, believed, and ignored.
 
 ---
 
+### 1.5 Phase 2: measured first, then the four things that were actually wrong
+
+The brief for this round was "optimise the intelligence core and prepare it for real GenAI". The
+first thing done was measuring, and the measurement refuted most of the plan:
+
+- 120 live turns (5 rounds x 12 brief phrasings) on three instances: **p50 6 ms, p95 18 ms, max
+  104 ms**, the maximum being the cold first turn of a conversation. Per-trace-phase means were 1-7 ms.
+- In-process micro-baselines (warmup, 400-2000 iterations): `classifyIntent` 0.040 ms,
+  `searchKnowledge` 0.033 ms, `searchKnowledge` + `rankProjects` 0.016 ms, one `registry.execute`
+  0.015-0.022 ms, `verifyAnswer` 0.005 ms.
+- The knowledge index is **already memoized** (`knowledgeIndex()` keeps a module-level `cached`
+  with `resetKnowledgeIndex()` as the test seam), `documentsByTag` filters 34 documents, and
+  `system_status` uses `peekDatabaseHandle()` while `inspectDatabase` reuses `getDatabase()` -
+  so there was no duplicate index build, no second database open, and nothing new to cache.
+
+Conclusion, stated plainly because it changes what "optimisation" means here: at 6 ms a turn, no
+micro-optimisation is observable. A 0.03 ms function is not a bottleneck at any traffic this app can
+be given. The only wins available were **avoidance and intelligence** - not spending a provider call
+at all, not sending bytes twice, not letting a duplicate tool call run. Four defects of that kind
+were found, and each one was a correctness bug disguised as a performance question:
+
+1. **A keyless local model could not be used at all.** `resolveProviderId` returned null without a
+   key, and `brain.ts` gated provider use on `apiKeyPresent`, while `providers/index.ts` said the
+   opposite in a comment and `.env.example` said "point RAVEN_BASE_URL at Ollama". Set only
+   `RAVEN_BASE_URL` + `RAVEN_MODEL` and the health route named a provider that the brain then
+   ignored, silently. Now a base URL *is* the intent (Google without a credential is still nothing),
+   and capability reporting was split in two: `providerConfigured` means "a key exists" (the console's
+   `LLM KEY` chip keeps that meaning), `providerUsable` means "this process can call it". Measured
+   after the fix, with no key anywhere in the environment: `status:READY`, `usable:true`,
+   `probed:{reachable:true, authorized:true, detail:'1 model(s) served; "stub-1" available'}`,
+   `capabilities:{jsonMode:true, streaming:false, toolCalling:false, vision:false}`,
+   `timeoutMs:25000`, `maxAttempts:3`, and a `genai` turn that really reaches the endpoint.
+2. **A stored fact could not preempt a model call.** Retrieval already selects memories by relevance
+   and `buildMessages` was already pasting them into a paid prompt. Now `memoryMatch()` runs before
+   any engine: a question with two or more content words in common with a stored record (one, if the
+   question is barely more than one word) is answered from the store. Measured on the same question,
+   same session, same build: **13 ms with one provider call → 7 ms with zero**, `mode=knowledge`,
+   `provider=none`, `verified=true`, answer quoting the value, its key and its date. The negative half
+   is asserted too - an irrelevant memory must not suppress a synthesis call.
+3. **Duplicate work was judged by tool name, not by call.** The agent phase skipped any tool that had
+   already run this turn, which made "compare these two projects" structurally unable to fetch two
+   project records. Deduplication is now keyed by `callSignature(tool, input)`: the same tool with
+   different arguments is different work, the identical call is still refused, and argument order does
+   not count as a difference. Measured live: `list_projects x1, get_skills x1, get_project x2` for a
+   comparison, with `agent-step-1` / `agent-step-2` on the runs (measured 14 ms, 6 citations).
+4. **Context was assembled by push order and could pay for the same sentence twice.** Every block is
+   now a `GroundingItem` with a source, a priority and a measured relevance; `selectContext()` sorts
+   by priority then relevance, deduplicates at sentence level (a `RAVEN:`-quoted copy of a record is
+   the same sentence, so the speaker label is stripped before comparing), drops a record whose body
+   was mostly already present rather than shipping a stub, and returns a **manifest**: every candidate,
+   its chars, included or excluded, and the reason. Measured on six real question shapes: the prompt
+   is **byte-identical to before** (26,632 chars total, 0 saved) - this corpus does not repeat itself
+   across the records a question retrieves - and in the duplication case the same builder removed
+   **266 chars of repeated prose**. So this is not a byte-saving claim; it is an inspectability and
+   worst-case guarantee, and it is reported as such. Live turns carry the accounting in
+   `metadata.provider.context` (e.g. `{chars:1472, kept:5, dropped:1, dedupedChars:202}`).
+
+Two verification checks were added because citations are receipts and were being trusted as
+decoration: `memory-citations-correspond` (a `memory:<key>` citation must name a key this session
+actually holds - a store-level `database:<driver>` citation is about the store, not a row, and is
+left alone) and `provider-citation-is-this-provider` (a provider citation must name the provider this
+turn called; a turn that called nothing cannot carry one). Both are blocking. `ToolRun` gained
+`stepId`, populated from the context while the step executes - the plan is numbered when it is
+bounded, so the run names the step and the step names the run back without either being guessed
+afterwards; it is deliberately not a new column on an audit table that nothing reads back.
+
+**Measured and rejected**, recorded so the next reader does not retry them: a WeakMap memoisation of
+the knowledge index (already memoized), caching `documentsByTag` (a 34-element filter, 0.03 ms),
+caching the system-status DB inspect (already reuses the handle), skipping the extra `searchKnowledge`
+inside `planAgentSteps` for comparisons (0.016 ms, and it answers a question the plan cannot otherwise
+ask), and any change to `lib/raven/knowledge/index.ts`. None of it is observable at 6 ms a turn.
+
+
 ## 2. Layer map
 
 ```
@@ -423,6 +496,17 @@ reports whether the secret is set — never its value.
 
 ---
 
+**Memory can answer, and now it answers first.** `brain.ts` holds one relevance rule -
+`memoryMatch(message, memories)` - shared by the pre-engine skip (a `genai` route with a strong
+memory match never reaches a provider: 7 ms, zero calls, `mode=knowledge`) and the pre-refusal
+branch (a `knowledge` route that found nothing in the corpus is answered from the store before the
+turn is refused). The wording lives in `memoryAnswer()`, so the two paths cannot drift apart and say
+different things about the same row. The floor is two shared content words, one if the question is a
+single content word; below that it is a coincidence and the store stays quiet. `kind` is derived in
+the row mappers from the key (a `preference.*` key is a preference), not stored, because a migration
+for a label is not a migration anyone can verify.
+
+
 ## 6. Knowledge engine (`lib/raven/knowledge/`)
 
 `corpus.ts` builds 24+ `KnowledgeDocument`s at module load from `data/siteConfig.ts` +
@@ -520,6 +604,52 @@ for one turn — `RAVEN_TIMEOUT_MS` is what a user should be able to reason abou
 `apiKeyPresent` and only `ravenApiKey()` returns the value, to the one caller that needs
 it. Asserted in the tests ("a configured key is never echoed by health or the brain").
 
+### What a provider reports about itself
+
+`ModelProvider` carries `capabilities`, `model`, `baseUrl`, `timeoutMs` and `maxAttempts`, set by the
+factory that builds it - never inferred from an environment variable at read time. `GET /api/health`
+echoes them so "which model, which endpoint, how many attempts, can it do JSON" is answerable without
+reading the source, and reports `null` for every one of them when nothing is resolvable, because a
+capability claimed for a provider that does not exist is the same class of lie as a fake answer:
+
+```json
+"provider": { "configured": false, "usable": true, "id": "openai", "model": "stub-1",
+              "baseUrl": "http://127.0.0.1:11434/v1", "timeoutMs": 25000, "maxAttempts": 3,
+              "capabilities": { "jsonMode": true, "streaming": false, "toolCalling": false, "vision": false } }
+```
+
+`configured` and `usable` are different sentences: a keyless Ollama endpoint is usable and not
+configured with a key; a Google endpoint with no key is neither. `system_status` reports both, plus
+`failing` from the breaker, and never touches the network itself. `toolCalling` is false for every
+provider because RAVEN gives a model no tool surface at all - the request is a system prompt and a
+user turn, which is asserted against the wire by a test that intercepts `fetch` and looks for
+`tools`, `functions`, `tool_choice` and `function_call`. `vision` is false because no image part is
+ever constructed.
+
+### Where streaming would attach (Phase 3)
+
+The contract today is one request, one JSON reply, and a client that animates its own working state
+until the server's real end state arrives. The seam, if streaming is ever built, is narrow and named
+here so it does not have to be rediscovered:
+
+1. `ProviderRequest` gains `stream?: boolean`; each provider either implements
+   `stream?(request): AsyncIterable<string>` or does not exist for that transport - the presence of
+   the method, not a config flag, is what says whether streaming is real.
+2. `POST /api/raven` would gain an `Accept: text/event-stream` branch that emits `meta`, then
+   `delta`s, then the same `verification` and `done` events the JSON body carries. Everything that
+   must not be streamed - verification, citations, `degraded`, the breaker decision - is computed
+   after the last delta, exactly as it is now.
+3. `lib/ravenClient.ts` would grow a reader loop beside `sendTurn`, and `ravenClient`'s existing
+   additive-only rule keeps the non-streaming path working untouched.
+4. Verification cannot be weakened by it: an answer that is still arriving has not been verified, so
+   `verified` stays absent until the final event. A UI that prints tokens before that moment is
+   showing unverified text, and must look like that.
+
+Not built in this phase: it would change the response contract, which every consumer depends on, for
+a latency improvement that a 6 ms local turn does not need - it matters only for remote models
+generating hundreds of words.
+
+
 ---
 
 ## 8. Tool system (`lib/raven/tools/`)
@@ -551,6 +681,13 @@ Actions are the honest boundary: `request_navigation` returns
 it proposes and `ravenStore.ts` performs the scroll and reports what it found.
 
 ---
+
+`callSignature(tool, input)` (registry) is the identity of a call: sorted keys, JSON values, and no
+suffix at all for a tool that takes nothing. Retrieval returns the signatures it executed, the agent
+phase seeds its duplicate set from them, and both the planner's skip rule and the loop's bookkeeping
+compare signatures rather than names. That is what makes "compare the first and third" possible while
+keeping a repeated identical call impossible, and it is asserted both ways.
+
 
 ## 9. Orchestration
 
@@ -608,6 +745,13 @@ but appends `I could not fully verify that … treat it as unconfirmed` and ship
 `verified:false`. A quieter lie is not an option.
 
 ---
+
+Two more blocking checks exist because a citation is a claim about a record:
+`memory-citations-correspond` (the key must be in this session's store) and
+`provider-citation-is-this-provider` (the citation must name the provider this turn called). Neither
+fires on a turn that has no such citation, so the ordinary knowledge path still reports the same
+number of checks it always did.
+
 
 ## 11. HTTP surface
 
@@ -744,12 +888,12 @@ No model, no database, no network needed:
 
 ```bash
 npm run check            # typecheck + schema drift + assets + speech + face + brain + backend
-npm run check:brain      # 100 checks: states, intents, retrieval, tools, memory, drivers
+npm run check:brain      # 107 checks: states, intents, retrieval, tools, memory, drivers
                          #   (including the SQLite one and its schema-parity proof), honesty,
                          #   degradation, canonical response contract, deterministic voice
                          #   selection, concurrency, referent resolution, and the intent shapes
                          #   the browser types
-npm run check:backend    # 40 checks: Gemini + OpenAI-compatible transports against a real
+npm run check:backend    # 47 checks: Gemini + OpenAI-compatible transports against a real
                          #   local HTTP server, Supabase REST over real HTTP, both routes,
                          #   the one-line-per-turn log, and a rejection's field set
 npm run typecheck
@@ -783,7 +927,8 @@ is the whole test infrastructure — no Jest, no Vitest, nothing to install.
 - **Owner auth, admin UI, rate-limit store shared across instances, queues, background
   jobs.** Rate limiting is per-process and documented as such.
 - **Streaming.** Single JSON reply; the console animates its own working state and then
-  adopts the server's real end state.
+  adopts the server's real end state. The seam is written down in §7 rather than left to whoever
+  implements it, and it is Phase 3 work on purpose: it changes the response contract.
 - **Storing raw provider traffic.** Only the answer text is persisted.
 
 ## 14. Cost

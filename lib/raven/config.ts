@@ -93,7 +93,15 @@ function resolveProviderId(apiKey: string | undefined): RavenProviderId | null {
   const forced = env('RAVEN_PROVIDER')?.toLowerCase()
   if (forced === 'none' || forced === 'off' || forced === 'local') return null
   if (forced === 'gemini' || forced === 'openai') return forced
-  if (!apiKey) return null
+  // Without a credential, a base URL *is* the intent. Local model servers (Ollama, LM Studio, vLLM)
+  // authenticate nothing, and `providers/index.ts` says so out loud — but this used to return null
+  // here, so `RAVEN_BASE_URL=… RAVEN_MODEL=…` selected no provider at all and said nothing about it.
+  // A remote endpoint that does want a key still gets an honest answer on the first request, and
+  // health keeps reporting `apiKeyPresent:false` either way.
+  if (!apiKey) {
+    const anonymous = env('RAVEN_BASE_URL')
+    return anonymous && !/generativelanguage\.googleapis\.com/.test(anonymous) ? 'openai' : null
+  }
   // A base URL pointing at a local model server is an OpenAI-compatible surface.
   const baseUrl = env('RAVEN_BASE_URL')
   if (baseUrl && !/generativelanguage\.googleapis\.com/.test(baseUrl)) return 'openai'
@@ -190,6 +198,14 @@ export function ravenConfig(): RavenConfig {
  */
 export type RavenCapabilities = {
   providerConfigured: boolean
+  /**
+   * A provider this process could actually call: an endpoint and a model are named, and either a
+   * credential exists or the endpoint is an OpenAI-compatible surface, which is allowed to have none
+   * (Ollama, LM Studio and most local servers authenticate nothing). Distinct from
+   * `providerConfigured`, which means "a key is present", because the two differ exactly where a
+   * local model is in use — and a reader must not be able to confuse them.
+   */
+  providerUsable: boolean
   providerId: RavenProviderId | null
   providerLabel: string
   providerModel: string | null
@@ -209,6 +225,10 @@ export type RavenCapabilities = {
 export function describeCapabilities(config = ravenConfig()): RavenCapabilities {
   return {
     providerConfigured: Boolean(config.provider.id && config.provider.apiKeyPresent),
+    // `id` is only non-null with a credential or a non-Google base URL, so this is "an endpoint was
+    // named", not "a key was found" — and `resolveProvider` remains the single authority on whether
+    // a provider object can be built from it.
+    providerUsable: Boolean(config.provider.id && config.provider.model && (config.provider.apiKeyPresent || Boolean(config.provider.baseUrl))),
     providerId: config.provider.id,
     providerLabel: config.provider.label,
     providerModel: config.provider.model,

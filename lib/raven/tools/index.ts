@@ -7,6 +7,7 @@
  * knows. That keeps the agentic loop fast, deterministic, and testable, and it means an
  * action is only ever "executed" when a local effect genuinely happened.
  */
+import { deriveMemoryKind } from '../memory/kind'
 import { focusAreas, glossary, skillNodes } from '@/data/ravenKnowledge'
 import { ToolRegistry, type ToolHandler } from './registry'
 import { describeCapabilities } from '../config'
@@ -385,7 +386,11 @@ const handlers: Record<string, ToolHandler> = {
     return {
       output: {
         provider: {
-          configured: capabilities.providerConfigured,
+          // "usable" = this process can call it (a local server needs no key); "keyPresent" is the
+          // separate fact, so a keyless Ollama setup is not reported as unconfigured and a key that
+          // exists is not reported as a model in use.
+          configured: capabilities.providerUsable,
+          keyPresent: capabilities.providerConfigured,
           id: capabilities.providerId,
           label: capabilities.providerLabel,
           model: capabilities.providerModel,
@@ -471,6 +476,7 @@ const handlers: Record<string, ToolHandler> = {
       value,
       importance: Number(input.importance ?? 0.75),
       source: 'explicit',
+      kind: deriveMemoryKind(key, value),
       createdAt: now,
       updatedAt: now,
     })

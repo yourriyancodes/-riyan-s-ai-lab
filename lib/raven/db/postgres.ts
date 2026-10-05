@@ -8,6 +8,7 @@
  * and says so. The adapter takes any object with a `query` method, which is what lets
  * the SQL be asserted in tests without a server.
  */
+import { withMemoryKind } from '../memory/kind'
 import { SCHEMA_STATEMENTS, TABLES } from './schema'
 import { isRavenState } from '../states'
 import type {
@@ -46,7 +47,7 @@ function message(row: Record<string, unknown>): ConversationMessageRecord {
 }
 
 function memory(row: Record<string, unknown>): MemoryRecord {
-  return {
+  return withMemoryKind({
     id: String(row.id),
     sessionId: String(row.session_id),
     key: String(row.key),
@@ -55,7 +56,7 @@ function memory(row: Record<string, unknown>): MemoryRecord {
     source: (['extracted', 'explicit', 'tool'] as const).includes(row.source as 'extracted') ? (row.source as MemoryRecord['source']) : 'extracted',
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
-  }
+  })
 }
 
 function json(value: unknown): string {

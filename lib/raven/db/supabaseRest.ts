@@ -7,6 +7,7 @@
  * the same schema, so the brain talks to it with `fetch`, and the SQL schema stays the
  * one in db/schema.sql. Same adapter, same rows, no new dependency.
  */
+import { withMemoryKind } from '../memory/kind'
 import { TABLES } from './schema'
 import type {
   AgentRunRecord,
@@ -217,7 +218,7 @@ export function createSupabaseRestDatabase(options: SupabaseRestOptions): Databa
 const wildcard = (term: string) => `*${term.replace(/[,()]/g, '')}*`
 
 function memoryFrom(row: Record<string, unknown>): MemoryRecord {
-  return {
+  return withMemoryKind({
     id: String(row.id),
     sessionId: String(row.session_id),
     key: String(row.key),
@@ -226,5 +227,5 @@ function memoryFrom(row: Record<string, unknown>): MemoryRecord {
     source: (['extracted', 'explicit', 'tool'] as const).includes(row.source as 'extracted') ? (row.source as MemoryRecord['source']) : 'extracted',
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
-  }
+  })
 }

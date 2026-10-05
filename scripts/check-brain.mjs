@@ -804,6 +804,237 @@ await check('unregistered tools are refused by the planner path too', async () =
   assert.ok(result.response.length > 0)
 })
 
+await check('an analysis request about these records reaches the agent, not the listing', async () => {
+  // Acceptance I, and the reason it was failing: "Analyse the retrieval pipeline and recommend what to
+  // improve first" contained a project word, so it scored `portfolio.projects` at 0.98 and was
+  // answered with the project listing. An evaluative verb plus a body of work is now its own rule,
+  // strong enough to clear both the listing and a named-project lookup, and it defers to the
+  // scope rules so a plan for a project that does not exist stays the refusal it was.
+  for (const [message, expected] of [
+    ['Analyse the retrieval pipeline in this project and recommend what to improve first', 'plan.multistep'],
+    ['review the RAG assistant and recommend improvements', 'plan.multistep'],
+    ['what should Riyan build next to strengthen this portfolio', 'plan.multistep'],
+    // A verdict on what already exists is a judgement across records, not an improvement plan; both
+    // intents reach the same engine, which is the part the turn has to get right.
+    ['assess the voice stack and tell me the weakest part', 'compare.evaluate'],
+  ]) {
+    assert.equal(classifyIntent(message).intent, expected, `${message} → ${classifyIntent(message).intent}`)
+  }
+  assert.match(classifyIntent('compare the projects and say which is weakest').intent, /compare.evaluate|plan.multistep/, 'a judgement across records lost its rule')
+  // The neighbours must not move: a listing is still a listing, a technology question is still a
+  // technology question.
+  assert.equal(classifyIntent('list the projects').intent, 'portfolio.projects', 'a plain listing became an analysis')
+  assert.equal(classifyIntent('what technologies does Riyan use?').intent, 'portfolio.skills', 'a skills question became an analysis')
+  const hypothetical = classifyIntent('for my next project I want to build a desktop app')
+  assert.notEqual(hypothetical.intent, 'plan.multistep', 'a plan for a project that does not exist was scored as a plan over these records')
+
+  // The turn, not just the label: real retrieval, real runs, citations, verification — and Rule 10,
+  // which says the model is a layer rather than the answer machine, so with no provider configured
+  // the same question is still answered from the records and says out loud that no model was involved.
+  const offline = await runBrainTurn({ message: 'Analyse the retrieval pipeline in this project and recommend what to improve first', sessionId: `eval-off-${Date.now()}`, skipPersistence: true })
+  assert.equal(offline.mode, 'agentic', `an analysis turn was answered as ${offline.mode}`)
+  assert.ok(offline.metadata.toolRuns.length >= 1, 'the analysis executed nothing')
+  assert.ok(offline.citations.length >= 1, 'an analysis without receipts')
+  assert.equal(offline.verified, true, 'the analysis did not survive its own verification')
+  assert.match(offline.response, /no model|records|scaffold/i, 'a deterministically composed answer has to say so')
+
+  const behaviour = { calls: [], mode: 'json' }
+  const withModel = await runBrainTurn(
+    { message: 'Analyse the retrieval pipeline in this project and recommend what to improve first', sessionId: `eval-on-${Date.now()}`, skipPersistence: true },
+    { providerOverride: stubProvider(behaviour) },
+  )
+  assert.equal(withModel.mode, 'agentic', `the model changed the mode to ${withModel.mode}`)
+  assert.ok(behaviour.calls.length >= 1, 'a synthesis-worthy analysis skipped the available model')
+  assert.equal(withModel.verified, true)
+  assert.ok(withModel.citations.length >= offline.citations.length, 'synthesis lost receipts the deterministic path had')
+  // The context the model was given is reported, not assumed.
+  assert.ok(withModel.metadata.provider?.context?.chars > 0, 'no context accounting on a provider turn')
+})
+
+await check('every memory carries a kind, derived the same way on every driver', async () => {
+  // Rule 6 asks for id/scope/key/value/kind/importance/createdAt/updatedAt on every record. `kind`
+  // is derived at the read boundary and named at the write, so no driver needs a new column for a
+  // label that is recomputable from the key and value it already stores — and a legacy row read from
+  // a file written before the field existed still reports one, which is what makes the three
+  // adapters agree instead of approximately agreeing.
+  const { deriveMemoryKind } = await import(`${ROOT}/lib/raven/memory/kind.ts`)
+  assert.equal(deriveMemoryKind('preference.answer.length', 'keep answers under 60 words'), 'preference')
+  assert.equal(deriveMemoryKind('note.1', 'I prefer Rust for services'), 'preference')
+  assert.equal(deriveMemoryKind('contact.email', 'riyan@example.com'), 'reference')
+  assert.equal(deriveMemoryKind('link.repo', 'https://github.com/riyan/ai-lab'), 'reference')
+  assert.equal(deriveMemoryKind('project.stack', 'my API is FastAPI'), 'fact')
+  assert.equal(deriveMemoryKind('answer.length.correction', '60 words, not 100'), 'correction')
+  assert.equal(deriveMemoryKind('misc.random', 'a sentence about something'), 'note')
+
+  const schema = read('lib/raven/db/schema.ts')
+  const memoriesDdl = schema.slice(schema.indexOf('raven_memories'), schema.indexOf('raven_memories') + 700)
+  assert.ok(!/^\s*kind\s+(text|varchar)/m.test(memoriesDdl), 'a kind column was added — the rule is derive, not migrate')
+
+  const { createMemoryDatabase } = await import(`${ROOT}/lib/raven/db/memoryStore.ts`)
+  const { createFileDatabase } = await import(`${ROOT}/lib/raven/db/fileStore.ts`)
+  const { createSqliteDatabase } = await import(`${ROOT}/lib/raven/db/sqlite.ts`)
+  const { readFile, writeFile } = await import('node:fs/promises')
+  const directory = await mkdtemp(join(tmpdir(), 'raven-kind-'))
+  const now = new Date(0).toISOString()
+  const makers = [
+    ['memory', () => createMemoryDatabase()],
+    ['file', () => createFileDatabase(join(directory, 'data'))],
+    ['sqlite', () => createSqliteDatabase({ path: join(directory, 'kind.db') })],
+  ]
+  for (const [driver, make] of makers) {
+    const adapter = await make()
+    const session = `kind-${driver}`
+    // Written without a `kind` on purpose: a row saved by an older build must still read correctly,
+    // which is the whole argument for deriving at the read boundary instead of storing a label.
+    await adapter.remember({ id: `${session}-k1`, sessionId: session, key: 'preference.answer.length', value: 'keep answers under 60 words', importance: 0.8, createdAt: now, updatedAt: now, source: 'explicit' })
+    await adapter.remember({ id: `${session}-k2`, sessionId: session, key: 'contact.email', value: 'riyan@example.com', importance: 0.6, createdAt: now, updatedAt: now, source: 'explicit' })
+    const recalled = await adapter.recallMemories(session, 5)
+    assert.equal(recalled.length, 2, `${driver}: recalled nothing`)
+    assert.deepEqual(
+      Object.fromEntries(recalled.map((memory) => [memory.key, memory.kind])),
+      { 'preference.answer.length': 'preference', 'contact.email': 'reference' },
+      `${driver} derived a different kind`,
+    )
+    const searched = await adapter.searchMemories(session, ['answers'], 5)
+    assert.equal(searched[0]?.kind, 'preference', `${driver}: a searched row had no kind`)
+    for (const field of ['id', 'sessionId', 'key', 'value', 'kind', 'importance', 'createdAt', 'updatedAt']) {
+      assert.ok(recalled.every((memory) => memory[field] !== undefined), `${driver}: ${field} missing from a stored memory`)
+    }
+    adapter.close?.()
+  }
+
+  // The file store keeps whole rows, so it is the one driver that can *have* a kind to respect.
+  // A stored value wins over the derivation, and a row stripped of it still gets one — both halves
+  // of the read-boundary rule, measured on the bytes actually on disk.
+  const memoryPath = join(directory, 'data', 'memories.json')
+  const onDisk = JSON.parse(await readFile(memoryPath, 'utf8'))
+  const firstRow = onDisk.find((row) => row.key === 'preference.answer.length')
+  assert.equal(firstRow.kind, 'preference', 'the kind was never written to the file store')
+  delete firstRow.kind
+  await writeFile(memoryPath, JSON.stringify(onDisk), 'utf8')
+  const reopened = await createFileDatabase(join(directory, 'data'))
+  const [legacy] = await reopened.recallMemories('kind-file', 5)
+  assert.equal(legacy.kind, 'preference', 'a row without a stored kind read back without one')
+  reopened.close?.()
+})
+
+await check('the tool allowlist is the registry, and nothing else can be named', async () => {
+  // Rule 11, in code: there is no path from a model's text to a capability. The names a turn may
+  // execute are exactly the names registered here, and a name that is not even shaped like a tool is
+  // refused for its shape rather than for the entry it missed, so error messages cannot be diffed to
+  // find out what else might exist.
+  const { validateModelToolCall } = await import(`${ROOT}/lib/raven/tools/registry.ts`)
+  const names = createToolRegistry().names()
+  assert.ok(names.length >= 16, 'the registry lost tools')
+  for (const name of names) assert.equal(validateModelToolCall(names, name).ok, true, `${name} is registered but was refused`)
+  for (const name of ['shell.exec', 'fs.readFile', 'net.fetch', 'process.env', 'sql.query', 'read_private_email', 'http_get_url', 'eval_js']) {
+    const verdict = validateModelToolCall(names, name)
+    assert.equal(verdict.ok, false, `${name} passed the tool allowlist`)
+    assert.match(String(verdict.reason), /not registered|not a tool name/)
+  }
+  assert.match(String(validateModelToolCall(names, 'Shell Exec').reason), /not a tool name/)
+})
+
+await check('a stored fact that answers the question is answered without asking a model', async () => {
+  // Rule 4 CASE B and the economy order in Rule 15: the cheapest thing that can answer, answers.
+  // Before this branch the store was read, the row was quoted into the prompt, and a paid model call
+  // was still made to restate it.
+  const behaviour = { calls: [], mode: 'json' }
+  const sessionId = `mem-first-${Date.now()}`
+  const conversationId = `c-${sessionId}`
+  await runBrainTurn({ message: 'Remember that my RAG glossary entry is: retrieve documents first, then explain the answer in simple terms.', sessionId, conversationId })
+  const asked = await runBrainTurn({ message: 'explain what RAG means in simple terms', sessionId, conversationId }, { providerOverride: stubProvider(behaviour) })
+  assert.equal(behaviour.calls.length, 0, `the model was asked ${behaviour.calls.length} time(s) for a sentence the store already had`)
+  assert.match(asked.response, /your own stored fact|not portfolio data/i, 'a memory answer has to name the store as its source')
+  assert.equal(asked.metadata.provider, null, 'the reply names a provider that was never called')
+  assert.equal(asked.verified, true, 'a quoted store value is evidence, so the turn has to verify')
+  assert.ok(asked.metadata.trace.some((event) => event.phase === 'memory-answer'), 'the trace must show the memory answered it')
+  assert.ok((asked.metadata.steps ?? 0) >= 0)
+
+  // The negative half, which is the dangerous one: an unrelated fact must not become a reason to
+  // skip the model. If this ever passes by matching on one shared word, the store starts answering
+  // questions it has nothing to say about.
+  const other = `mem-first-off-${Date.now()}`
+  const behaviour2 = { calls: [], mode: 'json' }
+  await runBrainTurn({ message: 'Remember that my favourite editor theme is teal.', sessionId: other, conversationId: `c-${other}` })
+  await runBrainTurn({ message: 'explain what RAG means in simple terms', sessionId: other, conversationId: `c-${other}` }, { providerOverride: stubProvider(behaviour2) })
+  assert.equal(behaviour2.calls.length, 1, `an irrelevant stored fact suppressed a synthesis call (calls=${behaviour2.calls.length})`)
+})
+
+await check('the same tool may run twice with different arguments; the same call may not run twice', async () => {
+  // Rule 9. The old duplicate check keyed on the tool name, so "compare these two projects" could
+  // only ever fetch one of them, and a retry with better arguments was impossible. Deduplication now
+  // happens per (tool, arguments), which is the only version of it that is actually redundant work.
+  const { planAgentSteps } = await import(`${ROOT}/lib/raven/agents/reasoning.ts`)
+  const { callSignature } = await import(`${ROOT}/lib/raven/tools/registry.ts`)
+  const message = 'compare the projects and tell me which one is closest to production'
+  const intent = classifyIntent(message)
+  assert.equal(intent.intent, 'compare.evaluate', `the comparison intent drifted: ${intent.intent}`)
+  const open = planAgentSteps({ intent, message, alreadyRan: new Set() })
+  const fetched = open.steps.filter((step) => step.tool === 'get_project')
+  assert.ok(fetched.length >= 2, `a comparison should fetch more than one project record: ${JSON.stringify(open.steps.map((step) => step.input))}`)
+  assert.equal(new Set(fetched.map((step) => JSON.stringify(step.input))).size, fetched.length, 'the plan itself repeated one call')
+
+  const firstOnly = planAgentSteps({ intent, message, alreadyRan: new Set([callSignature(fetched[0].tool, fetched[0].input)]) })
+  assert.ok(
+    firstOnly.steps.some((step) => step.tool === 'get_project' && JSON.stringify(step.input) !== JSON.stringify(fetched[0].input)),
+    'after one project was fetched the plan refused to fetch any other',
+  )
+
+  const allRan = planAgentSteps({ intent, message, alreadyRan: new Set(open.steps.map((step) => callSignature(step.tool, step.input))) })
+  assert.ok(!allRan.steps.some((step) => step.tool === 'get_project'), 'the plan re-ran calls that had already happened')
+  assert.ok(allRan.notes.some((note) => /skipped get_project/.test(note)), 'a skipped call has to be visible in the plan notes')
+
+  // A tool with no arguments is its own signature: repeating `list_projects` is still a repeat.
+  assert.equal(callSignature('list_projects', {}), 'list_projects')
+  assert.equal(callSignature('list_projects', undefined), 'list_projects')
+  assert.notEqual(callSignature('get_project', { ref: '01' }), callSignature('get_project', { ref: '03' }))
+  // Argument order is not a different call.
+  assert.equal(callSignature('search_knowledge', { query: 'rag', limit: 3 }), callSignature('search_knowledge', { limit: 3, query: 'rag' }))
+
+  // Steps are numbered when the plan is bounded, so a run can name the step it served and the step
+  // can name the run back — both ids exist before anything executes, neither is guessed afterwards.
+  assert.deepEqual(open.steps.map((step, index) => step.id), open.steps.map((unused, index) => `agent-step-${index + 1}`))
+})
+
+await check('an agentic run records which step asked for it', async () => {
+  const turn = await runBrainTurn({ message: 'Create a plan for improving Riyan’s AI portfolio.', sessionId: `stepid-${Date.now()}`, skipPersistence: true })
+  const runs = turn.metadata.toolRuns ?? []
+  assert.ok(runs.length >= 1, 'the agentic turn executed nothing, so there is nothing to check')
+  for (const run of runs) {
+    assert.ok(typeof run.stepId === 'string' ? /^agent-step-\d+$/.test(run.stepId) : run.stepId === null, `unexpected step id ${String(run.stepId)}`)
+    assert.equal(run.agentRunId, turn.metadata.agentRunId, 'a run inside an agent plan has to carry the plan’s run id')
+  }
+  // A turn that never planned must not invent step attribution.
+  const quiet = await runBrainTurn({ message: 'hello', sessionId: `stepid-quiet-${Date.now()}`, skipPersistence: true })
+  for (const run of quiet.metadata.toolRuns ?? []) assert.ok(!run.stepId, 'a non-agentic turn claimed a step id')
+})
+
+await check('a citation has to name a record that exists', async () => {
+  // Rule 12: citations are receipts. A `memory:<key>` citation for a key this session does not have,
+  // or a provider citation for a provider this turn did not call, is a fabricated record — the two
+  // ways an honest-looking answer can be built out of things that never happened.
+  const { verifyAnswer } = await import(`${ROOT}/lib/raven/agents/verification.ts`)
+  const intent = classifyIntent('what is my deployment port')
+  const base = { mode: 'knowledge', intent, runs: [], evidenceText: '', actions: [] }
+  const answer = 'You asked me to remember this: “4109”. That is your own stored fact.'
+  const fabricated = verifyAnswer({ ...base, answer, citations: [{ kind: 'memory', source: 'memory:ghost.key', label: 'Durable memory ghost.key', quote: '4109' }], provider: null, memoryKeys: ['deployment.port'] })
+  const orphan = fabricated.checks.find((check) => check.name === 'memory-citations-correspond')
+  assert.ok(orphan && !orphan.ok, 'a memory citation to a key the session does not have was accepted')
+  assert.equal(fabricated.verified, false, 'a fabricated record cannot verify')
+
+  const honest = verifyAnswer({ ...base, answer, citations: [{ kind: 'memory', source: 'memory:deployment.port', label: 'Durable memory deployment.port', quote: '4109' }], provider: null, memoryKeys: ['deployment.port'] })
+  const matched = honest.checks.find((check) => check.name === 'memory-citations-correspond')
+  assert.ok(matched?.ok, 'a real memory citation was refused by the correspondence check')
+
+  const noProvider = verifyAnswer({ ...base, answer: 'The model says it retrieves documents first, then answers.', citations: [{ kind: 'provider', source: 'provider:stub/stub-1', label: 'Model answer', quote: 'x' }], provider: null, memoryKeys: [] })
+  assert.ok(noProvider.checks.some((check) => check.name === 'provider-citation-is-this-provider' && !check.ok), 'a provider citation survived a turn that called no provider')
+  // The store-level citations tools emit (`database:<driver>`) describe the store, not one row, and
+  // stay outside this rule — asserting that keeps the check from quietly becoming a blanket rejection.
+  const storeLevel = verifyAnswer({ ...base, answer: 'You have 1 stored fact: deployment.port = 4109.', citations: [{ kind: 'memory', source: 'database:sqlite', label: 'Session memory', quote: 'deployment.port=4109' }], provider: null, memoryKeys: ['deployment.port'] })
+  assert.ok(!storeLevel.checks.some((check) => check.name === 'memory-citations-correspond'), 'a store-level citation was checked as if it named a row')
+})
+
 await check('every turn carries the canonical fields, on both success and refusal', async () => {
   const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
   const required = ['success', 'response', 'reply', 'mode', 'state', 'conversationId', 'citations', 'actions', 'memoryUpdates', 'verified', 'provider', 'trace', 'tools', 'memory', 'degraded']

@@ -9,7 +9,7 @@
  */
 import { describeCapabilities, ravenConfig } from '@/lib/raven/config'
 import { inspectDatabase } from '@/lib/raven/db'
-import { detectLocalProvider, probeProvider } from '@/lib/raven/providers'
+import { detectLocalProvider, probeProvider, resolveProvider } from '@/lib/raven/providers'
 import { providerBreakerState } from '@/lib/raven/brain'
 import { rateLimitSnapshot } from '@/lib/raven/rateLimit'
 import { corpusStats } from '@/lib/raven/knowledge/corpus'
@@ -25,7 +25,7 @@ export async function GET(request: Request): Promise<Response> {
   // `probe=0` opts out. Otherwise a configured provider is probed for real — the probe is
   // one model-list request and the provider caches it for a minute, so polling this
   // route cannot spend generation quota.
-  const shouldProbe = capabilities.providerConfigured && new URL(request.url).searchParams.get('probe') !== '0'
+  const shouldProbe = capabilities.providerUsable && new URL(request.url).searchParams.get('probe') !== '0'
 
   const database = await inspectDatabase(config)
   const providerProbe = shouldProbe ? await probeProvider(config) : null
@@ -37,7 +37,7 @@ export async function GET(request: Request): Promise<Response> {
   // A local server on this machine is detected and reported, never silently adopted: an operator
   // who started Ollama should see that RAVEN found it and what to set, and nobody should read a
   // detected endpoint as a used one. Skipped, like the provider probe, when `probe=0`.
-  const localModel = await detectLocalProvider(config, { probe: shouldProbe || !capabilities.providerConfigured })
+  const localModel = await detectLocalProvider(config, { probe: shouldProbe || !capabilities.providerUsable })
 
   const body = {
     ok: true,
@@ -50,10 +50,21 @@ export async function GET(request: Request): Promise<Response> {
     },
     provider: {
       configured: capabilities.providerConfigured,
+      usable: capabilities.providerUsable,
       id: capabilities.providerId,
       label: capabilities.providerLabel,
       model: capabilities.providerModel,
       baseUrl: config.provider.baseUrl,
+      // From the resolved provider, not from the environment: if the code cannot make one, these
+      // stay null instead of reporting what the variables say.
+      ...(() => {
+        const resolved = resolveProvider(config)
+        return {
+          timeoutMs: resolved?.timeoutMs ?? null,
+          maxAttempts: resolved?.maxAttempts ?? null,
+          capabilities: resolved?.capabilities ?? null,
+        }
+      })(),
       probed: providerProbe ? { reachable: providerProbe.reachable, authorized: providerProbe.authorized, detail: providerProbe.detail } : null,
       breaker: providerBreakerState(),
     },
@@ -88,17 +99,20 @@ export async function GET(request: Request): Promise<Response> {
     // `authorized: null` (never probed) also cannot earn READY — only a probe that came back
     // "yes, this credential works" does.
     status:
-      capabilities.providerConfigured && providerReachable && providerAuthorized === true && database.reachable
+      capabilities.providerUsable && providerReachable && providerAuthorized === true && database.reachable
         ? 'READY'
-        : capabilities.providerConfigured || database.reachable
+        : capabilities.providerUsable || database.reachable
           ? 'PARTIALLY_READY'
           : 'OFFLINE',
-    note: !capabilities.providerConfigured
-      ? 'Offline/local reasoning is active: no provider configured, so every answer comes from the deterministic knowledge and agent layers.'
+    // Every sentence here is about the endpoint, because a keyless local server is a real
+    // configuration: saying "a key exists but…" when no key was ever asked for would misreport the
+    // deployment to the one reader who cannot inspect it.
+    note: !capabilities.providerUsable
+      ? 'Offline/local reasoning is active: no provider endpoint is configured, so every answer comes from the deterministic knowledge and agent layers.'
       : providerReachable && providerAuthorized === false
-        ? 'The provider endpoint answered but rejected the credentials (401/403). The key is present and unusable; the brain degrades to local knowledge.'
+        ? 'The provider endpoint answered but rejected the credentials (401/403). Nothing is generated; the brain degrades to local knowledge.'
         : !providerReachable
-          ? 'A provider key exists but the endpoint did not answer; the brain degrades to local knowledge.'
+          ? 'The configured provider endpoint did not answer; the brain degrades to local knowledge.'
           : database.reachable
             ? 'Knowledge, provider and persistence are all live.'
             : 'Provider live, persistence degraded to its fallback store.',

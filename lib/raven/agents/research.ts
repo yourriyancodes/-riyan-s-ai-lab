@@ -7,6 +7,7 @@
  * schema-validated tool run — which is what makes `verified: true` mean something.
  */
 import type { Citation, IntentMatch, ToolCall, ToolRun } from '../types'
+import { callSignature, validateModelToolCall } from '../tools/registry'
 import type { ExecutedTool, ToolContext, ToolRegistry } from '../tools/registry'
 import { findProject } from '../knowledge/corpus'
 
@@ -126,6 +127,11 @@ export type RetrievalResult = {
   errors: { tool: string; error: string; status: string }[]
   succeeded: number
   total: number
+  /**
+   * `callSignature` of everything that really executed. The agent phase deduplicates against this,
+   * which is what lets it re-run a tool with new arguments while still refusing the identical call.
+   */
+  signatures?: Set<string>
 }
 
 /** Execute a plan and collect what came back. Nothing here throws. */
@@ -133,16 +139,21 @@ export async function runRetrieval(registry: ToolRegistry, plan: RetrievalPlan, 
   const outcomes = new Map<string, ExecutedTool>()
   const runs: ToolRun[] = []
   const citations: Citation[] = []
+  const signatures = new Set<string>()
   const errors: RetrievalResult['errors'] = []
   const calls: ToolCall[] = []
   let succeeded = 0
 
   for (const [index, call] of plan.calls.entries()) {
-    if (!registry.has(call.tool)) {
-      errors.push({ tool: call.tool, error: 'not registered in the tool registry', status: 'rejected' })
+    // The allowlist is checked before anything else runs: a call for a tool that is not registered —
+    // whether a planner asked for it or a model's JSON mentioned it — never reaches a handler.
+    const allowed = validateModelToolCall(registry.names(), call.tool)
+    if (!allowed.ok) {
+      errors.push({ tool: call.tool, error: allowed.reason ?? 'not registered in the tool registry', status: 'rejected' })
       continue
     }
     calls.push(call)
+    signatures.add(callSignature(call.tool, call.input))
     const outcome = await registry.execute(call, context)
     runs.push(outcome.run)
     onRun?.(outcome.run)
@@ -165,7 +176,7 @@ export async function runRetrieval(registry: ToolRegistry, plan: RetrievalPlan, 
     return true
   })
 
-  return { outcomes, runs, citations: unique, calls, rationale: plan.rationale, errors, succeeded, total: plan.calls.length }
+  return { outcomes, runs, citations: unique, calls, rationale: plan.rationale, errors, succeeded, total: plan.calls.length, signatures }
 }
 
 /** Read a nested field out of a tool output without asserting types we do not have. */

@@ -21,6 +21,8 @@ export type ToolContext = {
   /** Present when persistence is available; tools that need it must handle null. */
   adapter: import('../types').DatabaseAdapter | null
   agentRunId: string | null
+  /** Set by the agent loop for the duration of one step, so the run can cite the step it served. */
+  stepId?: string | null
   approvedActions: Set<string>
   now: () => string
   config: import('../config').RavenConfig
@@ -41,6 +43,33 @@ export type RegisteredTool = {
 export type ValidationResult = { ok: true; value: Record<string, unknown> } | { ok: false; errors: string[] }
 
 const typeOf = (value: unknown): string => (Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value)
+
+/**
+ * The identity of a call. Two executions of the same tool with different arguments are different
+ * work; the same tool with the same arguments cannot return anything new, and repeating it is what
+ * a loop looks like from the outside. Keying only on the tool name was the old rule, and it also
+ * made "compare these two projects" impossible — one `get_project` per turn, whichever reference the
+ * planner happened to ask for first.
+ */
+/**
+ * The only tool surface a model could ever influence: a name that is registered here. No provider in
+ * this build is handed a function-calling schema at all — the planner is server-side and deterministic
+ * — so this is the seam that keeps it that way. Anything a provider might suggest that is not on this
+ * list is rejected before a handler is looked up, which is what "the model cannot reach the shell,
+ * the filesystem, the network or the environment" means in code: there is no path from its text to a
+ * capability, only a path to a name that must already exist.
+ */
+export function validateModelToolCall(known: Iterable<string>, name: string): { ok: boolean; reason?: string } {
+  if (!/^[a-z][a-z0-9_]{1,39}$/.test(name)) return { ok: false, reason: `"${name}" is not a tool name this process accepts` }
+  if (!new Set(known).has(name)) return { ok: false, reason: `tool "${name}" is not registered in the tool registry` }
+  return { ok: true }
+}
+
+export function callSignature(tool: string, input: Record<string, unknown> | undefined): string {
+  const keys = Object.keys(input ?? {}).sort()
+  if (!keys.length) return tool
+  return `${tool}#${keys.map((key) => `${key}=${JSON.stringify((input as Record<string, unknown>)[key])}`).join(',')}`
+}
 
 export function validateToolInput(spec: ToolSpec, raw: unknown, limits: { maxStringChars?: number } = {}): ValidationResult {
   const maxStringChars = limits.maxStringChars ?? 400
@@ -198,6 +227,7 @@ export class ToolRegistry {
         startedAt: context.now(),
         finishedAt: new Date().toISOString(),
         agentRunId: context.agentRunId,
+        stepId: context.stepId ?? null,
         conversationId: context.conversationId,
       }
       try {

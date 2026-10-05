@@ -4,6 +4,7 @@
  * It is intentionally honest about being ephemeral — `status().detail` says so, the
  * console can show it, and nothing pretends a restart preserved anything.
  */
+import { withMemoryKind } from '../memory/kind'
 import type {
   AgentRunRecord,
   ConversationMessageRecord,
@@ -55,10 +56,12 @@ export function createMemoryDatabase(
     async remember(memory) {
       const existing = rows.memories.find((entry) => entry.sessionId === memory.sessionId && entry.key === memory.key)
       if (existing) Object.assign(existing, memory, { createdAt: existing.createdAt, updatedAt: memory.updatedAt })
-      else rows.memories.unshift({ ...memory })
+      // Written through, so a row always carries its kind; read through, so a file saved before the
+      // field existed still reports one. Deriving at both ends is what keeps three drivers identical.
+      else rows.memories.unshift(withMemoryKind({ ...memory }))
     },
     async recallMemories(sessionId, limit) {
-      return rows.memories.filter((memory) => memory.sessionId === sessionId).sort((a, b) => b.importance - a.importance).slice(0, limit)
+      return rows.memories.filter((memory) => memory.sessionId === sessionId).sort((a, b) => b.importance - a.importance).slice(0, limit).map((memory) => withMemoryKind(memory))
     },
     async searchMemories(sessionId, terms, limit) {
       const needles = terms.map((term) => term.toLowerCase()).filter(Boolean)
@@ -73,7 +76,7 @@ export function createMemoryDatabase(
         .filter((entry) => entry.score > 0)
         .sort((a, b) => b.score - a.score || b.memory.importance - a.memory.importance)
         .slice(0, limit)
-        .map((entry) => entry.memory)
+        .map((entry) => withMemoryKind(entry.memory))
     },
     async expireMemory(sessionId, key) {
       const index = rows.memories.findIndex((memory) => memory.sessionId === sessionId && memory.key === key)

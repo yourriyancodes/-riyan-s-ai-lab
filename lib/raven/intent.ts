@@ -159,6 +159,13 @@ const RULES: Rule[] = [
 
 // Projects are matched structurally rather than by keyword, so "the sign language
 // thing" finds the record and "what projects exist" still lists them.
+/** Asking for a judgement, an assessment, or a change — not for a list. */
+const EVALUATIVE_REQUEST = /\b(analys\w*|analyt\w*|review\w*|evaluate\w*|assess\w*|critique\w*|audit\w*|apprais\w*|improve\w*|strengthen\w*|better|worse|weaker|weakness|gap|bottleneck|recommend\w*|suggest\w*|prioriti[sz]\w*|optimi[sz]\w*|refactor\w*|what to fix|fix first)\b/i
+/** The thing being judged has to be a body of work, not any noun. */
+const BODY_OF_WORK = /\b(portfolio|projects?\b|site|repo|codebase|pipeline|architecture|system|agent|assistant|stack|retrieval|front\s?end|backend|database)\b/i
+/** Improvement-shaped: it wants a next step, not a verdict on what exists. */
+const IMPROVEMENT_ASK = /\b(improve\w*|strengthen\w*|what to fix|fix first|next|plan|roadmap|prioriti[sz]\w*|steps|first|later)\b/i
+
 const PROJECT_QUERY = /\bproject(s)?\b|\bwork(s)?\b|\bbuilt\b|\bportfolio\b|\bsystems?\b|\bapp(s)?\b|\bgames?\b/
 
 export type ClassifyOptions = {
@@ -439,6 +446,26 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
   }
 
   if (PROJECT_QUERY.test(lower)) add('portfolio.projects', 2.2, ['project-vocabulary'])
+
+  // A question that asks for a judgement is not a question that asks for a list. Measured live before
+  // this rule existed: "Analyse the retrieval pipeline in this project and recommend what to improve
+  // first" scored `portfolio.projects` at 0.98 — because it contains a project word — and was
+  // answered with the project listing. Honest, cited, and not the question that was asked. When an
+  // evaluative verb and a body of work both appear, the turn belongs to the agent: retrieve the
+  // records, then say something about them. The weight clears both the listing (2.2) and a named
+  // project lookup (3.6), because "analyse project 02" is still an analysis.
+  // A judgement about work that does not exist yet is not answerable from these records, and the
+  // existing suppression rules already say so — so the evaluative rule defers to them instead of
+  // out-voting a refusal with a confident plan for nothing.
+  if (
+    EVALUATIVE_REQUEST.test(lower) &&
+    BODY_OF_WORK.test(lower) &&
+    !OUTSIDE_SCOPE_REQUEST.test(lower) &&
+    !HYPOTHETICAL_REQUEST.test(lower)
+  ) {
+    if (IMPROVEMENT_ASK.test(lower)) add('plan.multistep', 4.2, ['evaluative-plan'])
+    else add('compare.evaluate', 4.2, ['evaluative-judgement'])
+  }
 
   const projectReference = extractProjectReference(text)
   if (projectReference) {

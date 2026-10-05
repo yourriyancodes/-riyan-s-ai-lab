@@ -20,23 +20,7 @@ import { tokenize } from './knowledge/search'
 import { routeTurn, type RouterCapabilities } from './router'
 import { transition, WORKING_STATES } from './states'
 import { providerBreakerState, recordProviderFailure, recordProviderSuccess } from './breaker'
-import type {
-  AgentStep,
-  Citation,
-  DatabaseAdapter,
-  IntentMatch,
-  MemoryUpdate,
-  ModelProvider,
-  PhaseEvent,
-  ProposedAction,
-  RavenIntent,
-  RavenMode,
-  RavenResponse,
-  RavenState,
-  RouteDecision,
-  ToolRun,
-  VisionContext,
-} from './types'
+import type { AgentStep, Citation, DatabaseAdapter, IntentMatch, MemoryRecord, MemoryUpdate, ModelProvider, PhaseEvent, ProposedAction, RavenIntent, RavenMode, RavenResponse, RavenState, RouteDecision, ToolRun, VisionContext } from './types'
 import { createToolRegistry, type ToolContext } from './tools'
 import type { ToolRegistry } from './tools/registry'
 import { planRetrieval, runRetrieval } from './agents/research'
@@ -136,6 +120,43 @@ function heldByBreaker(provider: ModelProvider, open: ReturnType<typeof provider
         ms: 0,
       }
     },
+  }
+}
+
+/**
+ * Does a stored fact answer this question outright?
+ *
+ * The floor is two shared content words, or one when the question is barely more than a word, so
+ * "what is my kubernetes operator port?" cannot be answered by a fact that shares only the word
+ * "port" — the same near-miss class the corpus composer refuses, applied to the memory side.
+ */
+function memoryMatch(message: string, memories: MemoryRecord[]): { memory: MemoryRecord; hits: number; terms: number } | null {
+  if (!memories.length) return null
+  const wanted = new Set(tokenize(message))
+  if (!wanted.size) return null
+  const scored = memories
+    .map((memory) => ({ memory, hits: tokenize(`${memory.key} ${memory.value}`).filter((term) => wanted.has(term)).length }))
+    .sort((a, b) => b.hits - a.hits)
+  const best = scored[0]!
+  if (best.hits >= 2 || (best.hits >= 1 && wanted.size <= 2)) return { ...best, terms: wanted.size }
+  return null
+}
+
+/** The wording of a memory-anchored answer. One place, because three near-identical sentences would drift. */
+function memoryAnswer(match: { memory: MemoryRecord; hits: number; terms: number }, source: string) {
+  const value = clip(String(match.memory.value), 300)
+  const when = String(match.memory.updatedAt ?? match.memory.createdAt ?? '').slice(0, 10)
+  return {
+    answer: `You asked me to remember this: “${value}”. That is your own stored fact${when ? ` (updated ${when})` : ''}, kept in the ${source} store under “${match.memory.key}”. It is not portfolio data, and nothing in the repository speaks to it.`,
+    value,
+    citation: {
+      kind: 'memory' as const,
+      source: `memory:${match.memory.key}`,
+      label: `Durable memory “${match.memory.key}”${when ? ` · ${when}` : ''}`,
+      locator: `${source} store, session-scoped`,
+      quote: value,
+    },
+    note: `matched “${match.memory.key}” on ${match.hits} of ${match.terms} question term(s)`,
   }
 }
 
@@ -324,7 +345,11 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     // An injected provider (tests, or a future console toggle) decides availability by
     // itself; otherwise it takes a resolvable provider *and* a credential to be "there".
     const provider = options.providerOverride !== undefined ? options.providerOverride : resolveProvider(config)
-    const providerAvailable = options.providerOverride !== undefined ? Boolean(options.providerOverride) : Boolean(provider) && config.provider.apiKeyPresent
+    // Whether a provider can be *called*, which `resolveProvider` already decided (a Gemini without a
+    // key resolves to nothing; a local OpenAI-compatible server needs no key at all). Requiring
+    // `apiKeyPresent` here as well made a keyless local endpoint resolvable but unusable — the health
+    // route would name it, the brain would ignore it, and no message explained the difference.
+    const providerAvailable = options.providerOverride !== undefined ? Boolean(options.providerOverride) : Boolean(provider)
     const breaker = providerBreakerState()
     const capabilities: RouterCapabilities = {
       providerAvailable,
@@ -497,6 +522,13 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       }
     }
 
+    // Computed before any engine runs, because it can make the engine unnecessary: a question the
+    // store answers outright is answered from the store, and the model is not asked (Rule 4 CASE B,
+    // Rule 15). `context.memories` is already relevance-selected, so this costs no extra read.
+    const stored = memoryMatch(message, context.memories)
+    // A memory answer is still evidence: the verifier reads the stored value alongside the corpus
+    // hits, so a number inside a fact the user dictated is not scored as hallucinated.
+    let memoryEvidence = ''
     tracker.enter(route.mode === 'agentic' ? 'REASONING' : 'RESEARCHING', 'retrieval', `intent ${intent.intent}, ${registry.names().length} tools available`)
     // The retrieval query may carry the resolved subject; the reply and the stored transcript
     // keep the user's own words, so nothing is attributed to them that they did not type.
@@ -634,7 +666,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         )
         answer = agentic.answer
         citations = agentic.citations
-        providerMeta = agentic.provider
+        providerMeta = agentic.provider ? { ...agentic.provider, ...(agentic.providerContext ? { context: agentic.providerContext } : {}) } : agentic.provider
         toolsUsed = [...new Set([...toolsUsed, ...agentic.toolsUsed])]
         stepRecords.push(...agentic.steps)
         if (agentic.synthesizedBy === 'deterministic') {
@@ -644,6 +676,20 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         if (agentic.providerFailure) recordProviderFailure()
         else if (agentic.synthesizedBy === 'provider') recordProviderSuccess()
       }
+    } else if (route.mode === 'genai' && stored) {
+      // No model call. The answer is a row in this session's store, quoted verbatim with its key
+      // and date, and the turn says so — which is cheaper, faster and less inventable than a
+      // synthesis of the same sentence. `provider: none` stays true because nothing was asked.
+      const composed = memoryAnswer(stored, context.source)
+      tracker.enter('VERIFYING', 'memory-answer', 'answered from the durable store; provider not called')
+      answer = composed.answer
+      memoryEvidence = composed.value
+      citations = [composed.citation]
+      mode = 'knowledge'
+      providerMeta = null
+      stepRecords.push({ action: 'read durable memory', status: 'succeeded', ms: 0, note: `${composed.note}; provider call skipped` })
+      // The VERIFYING phase above is already recorded as `memory-answer`; a second event for the same
+      // decision reads like two things happened.
     } else if (route.mode === 'genai') {
       tracker.enter('THINKING', 'provider-synthesis', provider ? `${provider.id}` : 'no provider resolved')
       const evidence = evidenceFromRetrieval(retrieval, message)
@@ -661,10 +707,10 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       const result = synthesis?.result
       if (result && result.ok) {
         answer = cleanReply(result.text)
-        providerMeta = { id: result.provider, label: provider?.label ?? result.provider, model: result.model }
+        providerMeta = { id: result.provider, label: provider?.label ?? result.provider, model: result.model, ...(synthesis ? { context: synthesis.contextReport } : {}) }
         citations.push({ kind: 'provider', source: `provider:${result.provider}/${result.model}`, label: 'Model answer, grounded in the retrieved portfolio records', quote: clip(answer ?? '', 300) })
         recordProviderSuccess()
-        stepRecords.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms, note: `${result.provider}/${result.model}${synthesis ? `, prompt ${synthesis.promptChars} chars` : ''}` })
+        stepRecords.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms, note: `${result.provider}/${result.model}${synthesis ? `, prompt ${synthesis.promptChars} chars${synthesis.contextReport.dedupedChars ? `, ${synthesis.contextReport.dedupedChars} duplicate chars dropped` : ''}${synthesis.contextReport.dropped ? `, ${synthesis.contextReport.dropped} item(s) over budget` : ''}` : ''}` })
       } else {
         const code = result && !result.ok ? result.code : 'no_provider'
         const detail = result && !result.ok ? result.message : 'no provider resolved for this process'
@@ -718,36 +764,14 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     // answered 502) because every composer reads only the repository's own records. The sentence
     // below says plainly that the source is the user's stored fact and that the corpus has nothing,
     // so a memory can never be mistaken for a claim about Riyan's data.
-    let memoryEvidence = ''
-    if (!answer && context.memories.length) {
-      const wanted = new Set(tokenize(message))
-      const scored = context.memories
-        .map((memory) => ({ memory, hits: tokenize(`${memory.key} ${memory.value}`).filter((term) => wanted.has(term)).length }))
-        .sort((a, b) => b.hits - a.hits)
-      const best = scored[0]
-      // One shared word is not a match, except when the question *is* one word plus stopwords.
-      // Without the floor, "what is my kubernetes operator port?" would happily be answered by a
-      // stored fact that only shares the word "port" — the same near-miss class the corpus composer
-      // refuses, applied to the memory side.
-      const strongEnough = best ? best.hits >= 2 || (best.hits >= 1 && wanted.size <= 2) : false
-      if (best && strongEnough) {
-        const value = clip(String(best.memory.value), 300)
-        const when = String(best.memory.updatedAt ?? best.memory.createdAt ?? '').slice(0, 10)
-        answer = `You asked me to remember this: “${value}”. That is your own stored fact${when ? ` (updated ${when})` : ''}, kept in the ${context.source} store under “${best.memory.key}”. It is not portfolio data, and nothing in the repository speaks to it.`
-        citations.push({
-          kind: 'memory',
-          source: `memory:${best.memory.key}`,
-          label: `Durable memory “${best.memory.key}”${when ? ` · ${when}` : ''}`,
-          locator: `${context.source} store, session-scoped`,
-          quote: value,
-        })
-        // The quote has to be part of the evidence the verifier reads, or the number inside it is
-        // "unsupported" — which would be true of the corpus and false of the turn.
-        memoryEvidence = value
-        mode = 'knowledge'
-        tracker.push('memory-answer', undefined, `answered from 1 of ${context.memories.length} stored fact(s); nothing in the corpus matched`)
-        stepRecords.push({ action: 'read durable memory', status: 'succeeded', ms: 0, note: `matched “${best.memory.key}” on ${best.hits} of ${wanted.size} question term(s)` })
-      }
+    if (!answer && stored) {
+      const composed = memoryAnswer(stored, context.source)
+      answer = composed.answer
+      memoryEvidence = composed.value
+      citations.push(composed.citation)
+      mode = 'knowledge'
+      tracker.push('memory-answer', undefined, `answered from 1 of ${context.memories.length} stored fact(s); nothing in the corpus matched`)
+      stepRecords.push({ action: 'read durable memory', status: 'succeeded', ms: 0, note: composed.note })
     }
 
     // Nothing grounded: say so instead of generating something.
@@ -817,7 +841,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       ...retrieval.citations.map((citation) => citation.quote ?? ''),
       ...[...retrieval.outcomes.values()].map((outcome) => JSON.stringify(outcome.output ?? '').slice(0, 4000)),
     ].join('\n')
-    const verification = verifyAnswer({ answer, mode, intent, citations, runs, evidenceText, actions: memoryResult.actions, provider: providerMeta })
+    const verification = verifyAnswer({ answer, mode, intent, citations, runs, evidenceText, actions: memoryResult.actions, provider: providerMeta, memoryKeys: context.memories.map((memory) => memory.key) })
     for (const check of verification.checks) {
       if (!check.ok || !check.blocking) {
         stepRecords.push({ id: `step-${stepRecords.length + 1}`, action: `verify ${check.name}`, status: check.ok ? 'succeeded' : check.blocking ? 'failed' : 'skipped', ms: 0, note: check.note })
@@ -837,7 +861,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         degradedFrom = route.mode
         degradedBecause = `verification rejected the ${route.mode} answer: ${verification.checks.filter((check) => !check.ok && check.blocking).map((check) => check.name).join(', ')}`
         providerMeta = null
-        const recheck = verifyAnswer({ answer: finalAnswer, mode, intent, citations, runs, evidenceText, actions: memoryResult.actions, provider: null })
+        const recheck = verifyAnswer({ answer: finalAnswer, mode, intent, citations, runs, evidenceText, actions: memoryResult.actions, provider: null, memoryKeys: context.memories.map((memory) => memory.key) })
         verified = recheck.verified
         tracker.push('re-verification', undefined, summarizeVerification(recheck))
       } else {

@@ -155,6 +155,12 @@ export type ToolRun = {
   finishedAt: string
   /** Present when the run happened inside an agent plan. Both ids are stored, never guessed. */
   agentRunId?: string | null
+  /**
+   * Which planned step asked for this execution, when the turn was agentic. It is part of the turn's
+   * run record and the trace; the audit table's durable join key stays `agent_run_id`, which is why
+   * this field is deliberately not a new column on a table nothing reads back.
+   */
+  stepId?: string | null
   conversationId?: string | null
 }
 
@@ -228,6 +234,12 @@ export type MemoryRecord = {
   createdAt: string
   updatedAt: string
   source: 'extracted' | 'explicit' | 'tool'
+  /**
+   * What kind of statement this is, derived from the key and the value (`memory/kind.ts`) rather
+   * than stored: it is a lens on the row, not a fact about the write. `scope` is `sessionId` — a
+   * memory is never read across sessions, and that boundary is enforced by the queries.
+   */
+  kind: 'preference' | 'fact' | 'reference' | 'correction' | 'note'
 }
 
 export type MemoryUpdate = {
@@ -334,6 +346,18 @@ export type ModelProvider = {
    */
   probe(): Promise<{ reachable: boolean; detail: string; authorized?: boolean }>
   generate(request: ProviderRequest): Promise<ProviderResult>
+  /**
+   * What this endpoint was actually built to do by the code that made it, so readiness can report
+   * facts instead of guesses. `toolCalling` is false everywhere today because RAVEN never hands a
+   * model a tool — the planner is server-side. `streaming` is false because the turn contract is one
+   * response; the seam for changing that is `ProviderRequest`/`buildMessages`, not this flag.
+   */
+  capabilities?: { jsonMode: boolean; streaming: boolean; toolCalling: boolean; vision: boolean }
+  /** The same values the factory was handed, reported back for /api/health. */
+  model?: string
+  baseUrl?: string
+  timeoutMs?: number
+  maxAttempts?: number
 }
 
 /* ------------------------------------------------------------------ *
@@ -360,7 +384,7 @@ export type RavenMetadata = {
   toolsUsed: string[]
   toolRuns: ToolRun[]
   agentRunId: string | null
-  provider: { id: string; label: string; model: string } | null
+  provider: { id: string; label: string; model: string; context?: { chars: number; kept: number; dropped: number; dedupedChars: number } } | null
   memory: { driver: string; retrieved: number; stored: number }
   database: { driver: string; configured: boolean; reachable: boolean; detail: string }
   latencyMs: number

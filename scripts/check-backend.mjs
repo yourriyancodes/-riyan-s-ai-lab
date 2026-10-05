@@ -571,6 +571,198 @@ await check('context is budgeted, dropping the least useful parts first', () => 
   assert.match(built.messages[0].content, /further source\(s\) trimmed/)
 })
 
+const packDoc = (id, title, body, extra = {}) => ({ id, title, body, score: 1, tags: ['project'], citation: { kind: 'knowledge', source: `data/${id}.json`, label: title, locator: id, quote: body.slice(0, 60) }, matched: [], phraseMatch: false, ...extra })
+
+await check('a paragraph that appears in two records is sent once, and the manifest says so', () => {
+  // Corpus records overlap: the same project description is in `data/siteConfig.ts` and in
+  // `data/portfolio.json`, and before this both were pasted into the prompt in full. Deduplication
+  // is per line, so a repeated paragraph is paid for once and the manifest records why the second
+  // copy is missing — a trimmed block that says nothing is how a reader starts distrusting quotes.
+  const shared = 'The agent retrieves portfolio records, ranks them, and answers with citations to the file each fact came from.'
+  const first = packDoc('site.project.01', 'AI Portfolio Intelligence Agent', `${shared} It also exposes a health endpoint.`)
+  const second = packDoc('portfolio.project.01', 'AI Portfolio Intelligence Agent (duplicate record)', `${shared} Written in TypeScript with Next.js.`)
+  const quotedByRaven = { role: 'assistant', content: shared }
+  const built = buildMessages({ question: 'how does the portfolio agent answer questions', sources: [first, second], citations: [], recentMessages: [quotedByRaven], memories: [], task: 'answer briefly' }, 3000)
+  const occurrences = built.messages[0].content.split(shared).length - 1
+  // The record keeps the sentence (priority 2 beats conversation 3); RAVEN's quote of it and the
+  // duplicate record both lose theirs. A role label in front of the sentence must not count as new
+  // content, because RAVEN's previous answers are assembled out of these same records.
+  assert.equal(occurrences, 1, `the duplicated paragraph was sent ${occurrences} times`)
+  // RAVEN's turn contained nothing but the duplicate, so its whole block is dropped — and the
+  // manifest says why, which is the difference between a budget and a silent edit.
+  const droppedQuote = built.manifest.find((entry) => entry.source === 'turn:assistant1')
+  assert.ok(droppedQuote && !droppedQuote.included && /already present|already in context/.test(String(droppedQuote.reason)), `the deduplicated quote was not accounted for: ${JSON.stringify(droppedQuote)}`)
+  assert.ok(built.dedupedChars > 0, 'deduplication happened but was not reported')
+  assert.ok(built.manifest.every((entry) => typeof entry.chars === 'number' && typeof entry.included === 'boolean'), 'the manifest lost its shape')
+  for (const entry of built.manifest.filter((candidate) => !candidate.included)) {
+    assert.match(String(entry.reason), /already present|already in context|budget/, `an omission was left unexplained: ${JSON.stringify(entry)}`)
+  }
+})
+
+await check('the task and the question are never what the budget cuts', () => {
+  // Priority is the whole point of tagging blocks: a tight budget must shed evidence before it sheds
+  // the instruction, or the model receives a topic with no question attached to it.
+  const huge = packDoc('site.project.09', 'Long record', 'y'.repeat(2600))
+  const built = buildMessages({ question: 'What does the retrieval step do?', sources: [huge], citations: [], recentMessages: [], memories: [], task: 'Answer from the records only.' }, 900)
+  assert.match(built.messages[0].content, /^TASK\nAnswer from the records only\./m, 'the task was cut')
+  assert.match(built.messages[0].content, /QUESTION\nWhat does the retrieval step do\?/, 'the question was cut')
+  assert.match(built.messages[0].content, /trimmed for context budget|fit the 900-character budget/, 'a dropped record has to be announced')
+  assert.ok(built.usedChars <= 900, `budget blown: ${built.usedChars}`)
+  assert.equal(built.truncated, true)
+})
+
+await check('which record survives a tight budget is decided by relevance, not by arrival order', () => {
+  const filler = 'It is documented in the repository with setup notes and a short architecture summary. '.repeat(3)
+  const off = packDoc('site.project.01', 'Raven 3D Portrait', `A procedurally lit portrait rendered in the browser with three.js. ${filler}`)
+  const also = packDoc('site.project.02', 'Voice pipeline', `Speech recognition and synthesis wiring for the assistant. ${filler}`)
+  const on = packDoc('site.project.03', 'Vector store', `Embeddings are stored in a vector database so retrieval can rank chunks by cosine similarity. ${filler}`, { phraseMatch: true })
+  const built = buildMessages({ question: 'which vector database stores the embeddings', sources: [off, also, on], citations: [], recentMessages: [], memories: [], task: 'answer briefly' }, 1500)
+  const kept = built.manifest.filter((entry) => entry.included && String(entry.source).startsWith('source:'))
+  assert.ok(kept.some((entry) => entry.source === 'source:site.project.03'), 'the record that answers the question was the one dropped')
+  assert.ok(built.manifest.some((entry) => !entry.included && entry.source.startsWith('source:')), 'the irrelevant records were kept instead of the relevant one')
+  assert.match(built.messages[0].content, /vector database/)
+})
+
+await check('every candidate is accounted for, at every budget', () => {
+  const sources = Array.from({ length: 9 }, (unused, index) => packDoc(`d${index}`, `Record ${index}`, `Body ${index}. ` + 'sentence about retrieval and citations. '.repeat(index + 1)))
+  const memories = [{ id: 'm1', key: 'style.answer', value: 'keep answers short', importance: 0.7 }]
+  const recent = [
+    { role: 'user', content: 'what about retrieval?' },
+    { role: 'assistant', content: 'Retrieval ranks records and cites them.' },
+  ]
+  for (const budget of [600, 900, 1200, 1800, 2600, 4000]) {
+    const built = buildMessages({ question: 'how is retrieval ranked', sources, citations: [], recentMessages: recent, memories, task: 'answer briefly' }, budget)
+    const candidates = sources.length + memories.length + recent.length + 2
+    assert.equal(built.manifest.length, candidates, `budget ${budget}: the manifest listed ${built.manifest.length} of ${candidates} candidates`)
+    const used = built.manifest.filter((entry) => entry.included).reduce((total, entry) => total + entry.chars, 0)
+    assert.ok(used <= Math.max(600, budget), `budget ${budget}: included ${used} chars`)
+    const dropped = built.manifest.filter((entry) => !entry.included)
+    assert.equal(dropped.length, built.droppedCount, `budget ${budget}: droppedCount disagreed with the manifest`)
+    assert.ok(dropped.every((entry) => entry.reason), `budget ${budget}: a drop was left unexplained`)
+    assert.ok(/QUESTION/.test(built.messages[0].content), `budget ${budget}: no question reached the model`)
+  }
+})
+
+await check('no provider is ever given a tool surface', async () => {
+  // Rule 11, verified on the wire rather than asserted in a comment: the request a model receives is
+  // a system prompt and a user turn. No `tools`, no `functions`, no `tool_choice` — so there is no
+  // channel through which a model could ask for the shell, the filesystem, the network or the
+  // environment, and the registry allowlist is the only place a tool name can come from.
+  const { createOpenAiCompatibleProvider } = await import(`${ROOT}/lib/raven/providers/openai.ts`)
+  const { createGeminiProvider } = await import(`${ROOT}/lib/raven/providers/gemini.ts`)
+  const original = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init.body)) })
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'Retrieval ranks records.', role: 'assistant' }, finish_reason: 'stop' }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const openai = createOpenAiCompatibleProvider({ baseUrl: 'http://127.0.0.1:9/v1', model: 'm', timeoutMs: 1500, maxRetries: 0, supportJsonMode: true })
+    const openaiResult = await openai.generate({ messages: [{ role: 'system', content: 'persona' }, { role: 'user', content: 'question' }], json: true })
+    assert.equal(openaiResult.ok, true, `the openai-compatible call failed: ${openaiResult.code} ${openaiResult.message}`)
+    const body = seen[0].body
+    for (const key of ['tools', 'tool_choice', 'functions', 'function_call']) assert.ok(!(key in body), `the OpenAI-compatible request carried ${key}`)
+    assert.deepEqual([...new Set(body.messages.map((message) => message.role))].sort(), ['assistant', 'system', 'user'].filter((role) => body.messages.some((message) => message.role === role)).sort(), 'roles beyond system/user/assistant reached the endpoint')
+    assert.equal(body.response_format?.type, 'json_object', 'json mode was asked for and not sent — the capability flag would be a lie')
+
+    globalThis.fetch = async (url, init) => {
+      seen.push({ url: String(url), body: JSON.parse(String(init.body)) })
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Retrieval ranks records.' }] }, finishReason: 'STOP' }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const gemini = createGeminiProvider({ apiKey: 'test-key', model: 'gemini-test', timeoutMs: 1500, maxRetries: 0 })
+    const geminiResult = await gemini.generate({ messages: [{ role: 'system', content: 'persona' }, { role: 'user', content: 'question' }], json: true })
+    assert.equal(geminiResult.ok, true, `the gemini call failed: ${geminiResult.code} ${geminiResult.message}`)
+    const sent = seen[seen.length - 1].body
+    assert.ok(!('tools' in sent), 'the Gemini request carried a tools block')
+    assert.equal(sent.generationConfig?.responseMimeType, 'application/json', 'json mode was asked for and not sent')
+
+    // And the capability flags the report shows are the ones the wire just demonstrated.
+    assert.deepEqual(openai.capabilities, { jsonMode: true, streaming: false, toolCalling: false, vision: false }, 'the reported capabilities drifted from what is sent')
+    assert.deepEqual(gemini.capabilities, { jsonMode: true, streaming: false, toolCalling: false, vision: false }, 'the reported capabilities drifted from what is sent')
+    assert.equal(openai.maxAttempts, 1, 'maxAttempts has to be attempts, not retries')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+await check('a keyless local endpoint is usable, and the key flag stays about the key', async () => {
+  // `providerConfigured` meant "a key exists", and the brain gated live calls on that key — so
+  // pointing RAVEN at Ollama with `RAVEN_BASE_URL` + `RAVEN_MODEL` resolved a provider in one place
+  // and refused it in another, with nothing saying so. Two flags now: what can be called, and whether
+  // a credential exists. Neither implies the other, and Google without a key is still nothing.
+  const { describeCapabilities, ravenConfig } = await import(`${ROOT}/lib/raven/config.ts`)
+  const { resolveProvider } = await import(`${ROOT}/lib/raven/providers/index.ts`)
+  const previous = { base: process.env.RAVEN_BASE_URL, model: process.env.RAVEN_MODEL, provider: process.env.RAVEN_PROVIDER }
+  const restore = () => {
+    for (const [name, value] of [['RAVEN_BASE_URL', previous.base], ['RAVEN_MODEL', previous.model], ['RAVEN_PROVIDER', previous.provider]]) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
+  try {
+    delete process.env.RAVEN_PROVIDER
+    process.env.RAVEN_BASE_URL = 'http://127.0.0.1:11434/v1'
+    process.env.RAVEN_MODEL = 'llama3.1'
+    const caps = describeCapabilities(ravenConfig())
+    assert.equal(caps.providerUsable, true, 'a local endpoint with no key was reported unusable')
+    assert.equal(caps.providerConfigured, false, 'the key flag has to stay about the key')
+    assert.ok(resolveProvider(ravenConfig()), 'resolveProvider refused a keyless OpenAI-compatible endpoint')
+
+    const health = await (await healthRoute.GET(new Request('http://localhost/api/health?probe=0'))).json()
+    assert.equal(health.provider.usable, true, 'health did not report the endpoint as callable')
+    assert.equal(health.provider.configured, false, 'health claimed a key that does not exist')
+    assert.match(String(health.note), /did not answer|degrades to local knowledge/, `unexpected note for an unreachable local endpoint: ${health.note}`)
+    assert.notEqual(health.status, 'READY', 'nothing answered, so nothing may claim readiness')
+
+    process.env.RAVEN_BASE_URL = 'https://generativelanguage.googleapis.com'
+    assert.equal(describeCapabilities(ravenConfig()).providerUsable, false, 'a Google endpoint without a credential was reported usable')
+    assert.equal(resolveProvider(ravenConfig()), null, 'a provider object was invented for a keyless Google call')
+    // A base URL with no model is not left ambiguous: `llama3.1` is the documented default for a
+    // local OpenAI-compatible server, and health echoes the model it will actually name, so "which
+    // model was assumed" is never a guess on the reader's side.
+    process.env.RAVEN_BASE_URL = 'http://127.0.0.1:11434/v1'
+    delete process.env.RAVEN_MODEL
+    const defaulted = ravenConfig()
+    assert.equal(defaulted.provider.model, 'llama3.1', 'the documented local default drifted')
+    assert.equal(describeCapabilities(defaulted).providerUsable, true, 'a base URL with the default model was reported unusable')
+    const shown = await (await healthRoute.GET(new Request('http://localhost/api/health?probe=0'))).json()
+    assert.equal(shown.provider.model, 'llama3.1', 'health reported a different model than the one configured')
+  } finally {
+    restore()
+  }
+})
+
+await check('health reports provider limits as measured, and null where nothing is configured', async () => {
+  // The provider block used to say only whether a key was present. Rule 21 asks for the request
+  // facts: model, endpoint, per-attempt timeout, attempts, and what the endpoint was wired to do.
+  // With no provider resolvable these are `null`, not defaults — reporting `streaming:false` for a
+  // provider that does not exist would be a claim about nothing.
+  const bare = await healthRoute.GET(new Request('http://localhost/api/health?probe=0'))
+  const bareBody = await bare.json()
+  assert.equal(bareBody.provider.capabilities, null, 'capabilities were invented for an unconfigured provider')
+  assert.equal(bareBody.provider.timeoutMs, null, 'a timeout was reported for no endpoint')
+  assert.equal(bareBody.provider.maxAttempts, null)
+
+  const previous = { base: process.env.RAVEN_BASE_URL, model: process.env.RAVEN_MODEL }
+  process.env.RAVEN_BASE_URL = 'http://127.0.0.1:9/v1'
+  process.env.RAVEN_MODEL = 'measured-model'
+  try {
+    const withProvider = await healthRoute.GET(new Request('http://localhost/api/health?probe=0'))
+    const body = await withProvider.json()
+    assert.equal(body.provider.model, 'measured-model')
+    assert.equal(body.provider.baseUrl, 'http://127.0.0.1:9/v1')
+    assert.equal(typeof body.provider.timeoutMs, 'number', 'the resolved provider’s timeout is not reported')
+    assert.ok(body.provider.maxAttempts >= 1, 'attempts are not reported')
+    assert.deepEqual(body.provider.capabilities, { jsonMode: true, streaming: false, toolCalling: false, vision: false }, 'the capability block drifted from what the client actually sends')
+    assert.ok(!JSON.stringify(body).includes('test-key'), 'a credential reached the health payload')
+  } finally {
+    if (previous.base === undefined) delete process.env.RAVEN_BASE_URL
+    else process.env.RAVEN_BASE_URL = previous.base
+    if (previous.model === undefined) delete process.env.RAVEN_MODEL
+    else process.env.RAVEN_MODEL = previous.model
+  }
+})
+
 await check('JSON extraction survives fences and prose wrappers', () => {
   assert.deepEqual(extractJsonObject('```json\n{"answer":"hi"}\n```'), { answer: 'hi' })
   assert.deepEqual(extractJsonObject('Sure! {"answer":"hi"} hope that helps'), { answer: 'hi' })

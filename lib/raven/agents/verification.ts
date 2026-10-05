@@ -26,6 +26,8 @@ export type VerifyInput = {
   evidenceText: string
   actions: ProposedAction[]
   provider: { id: string; model: string } | null
+  /** The keys this session's store actually holds, so a memory citation can be checked against them. */
+  memoryKeys?: string[]
 }
 
 /** Claims of a completed action, mapped to the tool whose run would justify them. */
@@ -203,6 +205,38 @@ export function verifyAnswer(input: VerifyInput): VerificationReport {
   const truncatedRuns = input.runs.filter((run) => run.error?.includes('truncated'))
   if (truncatedRuns.length) {
     checks.push({ name: 'tool-output-size', ok: true, note: `${truncatedRuns.length} tool output(s) were truncated before synthesis`, blocking: false })
+  }
+
+  // A citation is a receipt, so it has to name a thing that exists. Only the two kinds that can be
+  // checked against this turn are checked: a `memory:<key>` citation must match a key the session
+  // store actually has, and a provider citation must name the provider this turn called. Tool
+  // citations of the form `database:<driver>` describe the store rather than one row, so they are
+  // left alone, and knowledge citations are already required to appear in the evidence above.
+  const keyCitations = input.citations.filter((citation) => String(citation.source).startsWith('memory:'))
+  if (keyCitations.length) {
+    const keys = new Set(input.memoryKeys ?? [])
+    const orphaned = keyCitations.filter((citation) => !keys.has(String(citation.source).slice('memory:'.length)))
+    checks.push({
+      name: 'memory-citations-correspond',
+      ok: orphaned.length === 0,
+      note: orphaned.length
+        ? `${orphaned.length} memory citation(s) name a key this session does not have (${orphaned.map((citation) => citation.source).join(', ')})`
+        : `${keyCitations.length} memory citation(s) matched stored record(s)`,
+      blocking: true,
+    })
+  }
+  const providerCitations = input.citations.filter((citation) => citation.kind === 'provider')
+  if (providerCitations.length) {
+    const expected = input.provider ? `provider:${input.provider.id}/${input.provider.model}` : null
+    const mismatched = providerCitations.filter((citation) => !expected || citation.source !== expected)
+    checks.push({
+      name: 'provider-citation-is-this-provider',
+      ok: mismatched.length === 0,
+      note: mismatched.length
+        ? `cited ${mismatched.map((citation) => citation.source).join(', ')} but this turn ${expected ? `called ${expected}` : 'called no provider'}`
+        : `${providerCitations.length} provider citation(s) match the provider this turn called`,
+      blocking: true,
+    })
   }
 
   const verified = checks.every((check) => check.ok || !check.blocking)
