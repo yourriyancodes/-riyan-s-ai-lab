@@ -284,10 +284,12 @@ were found, and each one was a correctness bug disguised as a performance questi
    the same sentence, so the speaker label is stripped before comparing), drops a record whose body
    was mostly already present rather than shipping a stub, and returns a **manifest**: every candidate,
    its chars, included or excluded, and the reason. Measured on six real question shapes: the prompt
-   is **byte-identical to before** (26,632 chars total, 0 saved) - this corpus does not repeat itself
-   across the records a question retrieves - and in the duplication case the same builder removed
-   **266 chars of repeated prose**. So this is not a byte-saving claim; it is an inspectability and
-   worst-case guarantee, and it is reported as such. Live turns carry the accounting in
+   is **byte-identical to before** (26,632 chars, 0 saved), because the records one question retrieves
+   do not repeat themselves; on the twelve brief phrasings with RAVEN's previous answer *quoting* a
+   retrieved record - a normal second turn - `node scripts/measure.mjs context` reports **41,828 chars
+   with 1,717 duplicate chars removed (~4%) and 6 items dropped for budget**. So this is not a blanket
+   byte-saving claim: it is a saving exactly when a session repeats itself, a worst-case guarantee, and
+   a manifest that makes the decision readable. Live turns carry the accounting in
    `metadata.provider.context` (e.g. `{chars:1472, kept:5, dropped:1, dedupedChars:202}`).
 
 Two verification checks were added because citations are receipts and were being trusted as
@@ -897,6 +899,14 @@ npm run check:backend    # 47 checks: Gemini + OpenAI-compatible transports agai
                          #   local HTTP server, Supabase REST over real HTTP, both routes,
                          #   the one-line-per-turn log, and a rejection's field set
 npm run typecheck
+
+# Measurements, on a running instance or against the source alone:
+node scripts/measure.mjs turns  --port 3102 --rounds 3   # turn latency percentiles, by engine
+node scripts/measure.mjs phases --port 3102 --rounds 5   # mean ms per trace phase
+node --experimental-strip-types --disable-warning=ExperimentalWarning \
+     --import ./scripts/lib/tsr.mjs scripts/measure.mjs micro    # per-function floors
+node --experimental-strip-types --disable-warning=ExperimentalWarning \
+     --import ./scripts/lib/tsr.mjs scripts/measure.mjs context  # what each prompt is made of
 npm run schema           # regenerate db/schema.sql after editing schema.ts
 ```
 

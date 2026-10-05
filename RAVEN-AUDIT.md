@@ -230,11 +230,16 @@ OpenAI-compatible endpoint:
 | --- | --- |
 | turn latency | **p50 6 ms · p95 18 ms · max 104 ms** (the max is a conversation's cold first turn) |
 | per-phase means | input 1 · persistence 1–2 · context 1 · intent 1 · route 0 · retrieval 2–4 · synthesis 1 · verification 1–7 ms |
-| `classifyIntent` | 0.040 ms (400 iterations, in-process, warm) |
-| `searchKnowledge` | 0.033 ms |
+| `classifyIntent` | 0.040–0.047 ms |
+| `searchKnowledge` | 0.033–0.044 ms |
 | `searchKnowledge` + `rankProjects` | 0.016 ms |
-| `registry.execute` (one tool, real handler) | 0.015–0.022 ms |
-| `verifyAnswer` | 0.005 ms |
+| `registry.execute` (one tool, real handler) | 0.016–0.089 ms (`list_projects` 0.026, `search_knowledge` 0.089) |
+| `verifyAnswer` | 0.005–0.054 ms, scaling with the number of citations |
+| `selectContext` (12 candidates) | 0.052 ms |
+
+The ranges are what the committed harness prints (`node … scripts/measure.mjs micro`), not a
+single lucky run: an earlier draft of this table quoted one measurement per row, and re-running it
+moved `verifyAnswer` by 10×. A floor that depends on the fixture is reported with its fixture.
 
 So: a whole local turn costs about the same as one network round trip to any provider. The
 engine has no bottleneck to remove; it has **wasted work to avoid**. Everything below is avoidance.
@@ -333,13 +338,17 @@ copy of a record is the same sentence, so the speaker label is stripped before c
 record whose body was mostly already present rather than shipping a stub of it, and returns a manifest:
 every candidate, its char count, included or excluded, with the reason.
 
-Measured against the Phase-1 builder on six real question shapes: **26,632 chars before, 26,632 after
-— byte-identical, 0 saved**, because this corpus does not repeat itself across the records a question
-retrieves. In the case it *does* (one paragraph quoted by two records and by RAVEN's previous answer)
-the same builder removed **266 chars** and the paragraph went from four copies to one. So the correct
-claim is not "the prompt got smaller"; it is **the prompt cannot silently get bloated, and the turn can
-now show its work** (`metadata.provider.context`, e.g. `{chars:1472, kept:5, dropped:1, dedupedChars:202}`
-measured live). On the local corpus the whole selection costs under 0.05 ms.
+Measured two ways, because the two ways answer different questions. Against the Phase-1 builder on
+six question shapes with an unrelated previous answer: **26,632 chars before, 26,632 after —
+byte-identical, 0 saved**, since a single question's retrieved records do not repeat themselves.
+Against the same builder on the twelve brief phrasings *with RAVEN's previous answer quoted from the
+retrieved record* — which is what a real second turn looks like — `scripts/measure.mjs context` reports
+**41,828 chars of prompt with 1,717 duplicate chars removed (≈4%) and 6 items dropped for budget**,
+149–248 chars per turn. So the honest sentence is not "the prompt got smaller": it is **the prompt gets
+smaller in exactly the case where a session repeats itself, never silently, and the turn can now show
+its work** (`metadata.provider.context`, e.g. `{chars:1472, kept:5, dropped:1, dedupedChars:202}`
+measured live). The selection itself costs 0.05 ms for twelve candidates, the same order as the search
+that feeds it — reproducible with `node … scripts/measure.mjs micro`.
 
 ## P2.9 Failure and degradation — nothing to change
 
