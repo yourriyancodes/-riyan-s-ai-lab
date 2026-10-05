@@ -10,7 +10,12 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
 export const SESSION_COOKIE = 'raven_session'
-const ID_PATTERN = /^[A-Za-z0-9_-]{6,64}$/
+/**
+ * Charset-validated, and the floor is 3 characters rather than 6 — see the reasoning on
+ * `readOpaqueId`. Anything in this set is safe to use as a bound parameter value, which is the only
+ * thing an id of this shape is ever used for.
+ */
+const ID_PATTERN = /^[A-Za-z0-9_-]{3,64}$/
 
 const idPrefix = {
   conversation: 'conv',
@@ -26,7 +31,16 @@ export function newId(kind: keyof typeof idPrefix, hint?: string): string {
   return `${idPrefix[kind]}-${base}${suffix}`
 }
 
-/** Anything the client sends is validated before it reaches a query. */
+/**
+ * Anything the client sends is validated before it reaches a query.
+ *
+ * A rejected id is not reported as an error: it becomes a *new* session or conversation. That is the
+ * dangerous part — the turn succeeds and the next one has no history, which reads to the user as
+ * the assistant forgetting them on purpose. So the pattern accepts any short alphanumeric token, and
+ * the route publishes which source it used (`x-raven-session-source`) so a caller can tell the two
+ * apart. Measured live: a 4-character session header was being re-minted, and a stored memory
+ * vanished without an error anywhere.
+ */
 export function readOpaqueId(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()

@@ -116,8 +116,17 @@ export async function POST(request: Request): Promise<Response> {
 
   // A conversation id is chosen by the client when it has one (reload continuity), and
   // by the server otherwise. Both are validated, so nothing arbitrary reaches a query.
+  //
+  // The length floor is 3, not 6: a rejected id is not an error, it is a *new conversation* — so
+  // a client using a short id gets amnesia one turn later and no failure to notice. That was
+  // measured live ("Which one uses RAG?" lost its referent because the harness used `p13`). Any
+  // id in the character set is safe to honour, since every query binds it as a parameter; the
+  // floor only exists to keep a stray "?" or "" from becoming a conversation.
+  const clientConversationId =
+    typeof body.conversationId === 'string' && /^[A-Za-z0-9_-]{3,64}$/.test(body.conversationId.trim()) ? body.conversationId.trim() : null
+  const usedClientConversationId = Boolean(clientConversationId)
   const conversationId =
-    (typeof body.conversationId === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(body.conversationId.trim()) ? body.conversationId.trim() : null) ??
+    clientConversationId ??
     `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 
   const result = await runBrainTurn({
@@ -136,6 +145,10 @@ export async function POST(request: Request): Promise<Response> {
     'x-raven-latency-ms': String(Date.now() - startedAt),
   }
   if (session.issuedCookie) headers['set-cookie'] = `${session.issuedCookie}`
+  // Which identity this turn was filed under, and where it came from. `generated` means the caller's
+  // id was unusable, which is the difference between "it forgot me" and "my id never arrived".
+  headers['x-raven-session-source'] = session.source
+  headers['x-raven-conversation-source'] = usedClientConversationId ? 'client' : 'generated'
   if (result.error?.retryAfterMs) headers['retry-after'] = String(Math.ceil(result.error.retryAfterMs / 1000))
   if (result.metadata) headers['x-raven-breaker'] = providerBreakerState().open ? 'open' : 'closed'
 

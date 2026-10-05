@@ -166,6 +166,29 @@ export function composeKnowledgeAnswer(input: KnowledgeInput): KnowledgeAnswer |
     }
 
     case 'portfolio.skills': {
+      // Project-scoped first: "what technologies does it use?" after a project was resolved is a
+      // question about that record's stack, not about every node in the site's skill graph. The
+      // provenance is named because the two lists are different data with different owners.
+      const projectRecord = data(retrieval, 'get_project')
+      const projectStack = projectRecord ? pick<string[]>(projectRecord, 'stack') ?? [] : []
+      const projectName = projectRecord ? String(pick<string>(projectRecord, 'name') ?? '').trim() : ''
+      const projectCategory = projectRecord ? String(pick<string>(projectRecord, 'technology') ?? '').trim() : ''
+      if (projectName && projectStack.length) {
+        return {
+          answer: `${projectName} declares: ${projectStack.join(', ')}.${projectCategory ? ` Category on the card: ${projectCategory}.` : ''} That is the project\u2019s own record, not the site-wide skill list — ask about the skills section for that.`,
+          citations,
+          toolsUsed,
+          note: 'answered from the project detail entry because the question resolved to one project',
+        }
+      }
+      if (projectName) {
+        return {
+          answer: `${projectName}${projectCategory ? ` is filed under ${projectCategory}` : ''}. The portfolio documents no separate stack list for it, so this is the whole record — the site-wide skill graph is a different list, and I have not blended the two.`,
+          citations,
+          toolsUsed,
+          note: 'no stack entry on the project detail record; answered from the card category alone',
+        }
+      }
       const record = data(retrieval, 'get_skills')
       if (!record) return null
       const nodes = pick<{ name: string; category: string; description: string }[]>(record, 'skillNodes') ?? []

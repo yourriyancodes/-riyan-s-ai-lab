@@ -179,6 +179,14 @@ export type ToolSpec = {
   /** Milliseconds; enforced by the registry, not by the tool. */
   timeoutMs?: number
   /**
+   * Whether the same input produces the same output for as long as the process lives. A tool that
+   * reads a mutable store, reports live runtime state, or writes anything is `false`: a plan step
+   * over it may legitimately return something new, and re-running it for "the same" evidence buys
+   * nothing. `true` is a promise the agent is allowed to rely on — it is what makes one answer per
+   * turn correct rather than lucky.
+   */
+  deterministic: boolean
+  /**
    * `action` tools change something (write a memory, move the UI). They are only
    * executed when the request explicitly approved them.
    */
@@ -256,6 +264,10 @@ export type ConversationRecord = {
 export type AgentRunStatus = 'planned' | 'running' | 'verified' | 'failed' | 'partial'
 
 export type AgentStep = {
+  /** Position in this turn, assigned as the record is made: `step-1`, `step-2`, … */
+  id?: string
+  /** The persisted tool-run row this step summarises, when there is one. */
+  runId?: string
   /** Short human-readable label, e.g. `retrieve projects`. */
   action: string
   tool?: string

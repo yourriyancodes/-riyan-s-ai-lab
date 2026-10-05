@@ -9,7 +9,7 @@
  */
 import { describeCapabilities, ravenConfig } from '@/lib/raven/config'
 import { inspectDatabase } from '@/lib/raven/db'
-import { probeProvider } from '@/lib/raven/providers'
+import { detectLocalProvider, probeProvider } from '@/lib/raven/providers'
 import { providerBreakerState } from '@/lib/raven/brain'
 import { rateLimitSnapshot } from '@/lib/raven/rateLimit'
 import { corpusStats } from '@/lib/raven/knowledge/corpus'
@@ -34,6 +34,10 @@ export async function GET(request: Request): Promise<Response> {
   // working model. `authorized` is null when no probe ran or the endpoint never got to
   // judge the credential — null is "unknown", and it is printed as such rather than as false.
   const providerAuthorized = providerProbe ? providerProbe.authorized : null
+  // A local server on this machine is detected and reported, never silently adopted: an operator
+  // who started Ollama should see that RAVEN found it and what to set, and nobody should read a
+  // detected endpoint as a used one. Skipped, like the provider probe, when `probe=0`.
+  const localModel = await detectLocalProvider(config, { probe: shouldProbe || !capabilities.providerConfigured })
 
   const body = {
     ok: true,
@@ -53,6 +57,13 @@ export async function GET(request: Request): Promise<Response> {
       probed: providerProbe ? { reachable: providerProbe.reachable, authorized: providerProbe.authorized, detail: providerProbe.detail } : null,
       breaker: providerBreakerState(),
     },
+    localModel,
+    // The breaker in the shape the brief asks for: a name plus the remaining cooldown, so a reader
+    // does not have to know that `openForMs` is the countdown. Both views are the same measurement.
+    breaker: (() => {
+      const open = providerBreakerState()
+      return { state: open.open ? ('open' as const) : ('closed' as const), failures: open.failures, cooldownMs: open.openForMs, threshold: open.threshold }
+    })(),
     database: {
       driver: database.driver,
       configured: database.configured,
@@ -92,9 +103,16 @@ export async function GET(request: Request): Promise<Response> {
             ? 'Knowledge, provider and persistence are all live.'
             : 'Provider live, persistence degraded to its fallback store.',
     knowledge: corpusStats(),
-    tools: TOOL_SPECS.map((entry) => ({ name: entry.spec.name, permission: entry.spec.permission, requiresApproval: Boolean(entry.spec.requiresApproval) })),
+    tools: TOOL_SPECS.map((entry) => ({ name: entry.spec.name, permission: entry.spec.permission, requiresApproval: Boolean(entry.spec.requiresApproval), deterministic: entry.spec.deterministic })),
     states: RAVEN_STATES,
     rateLimit: rateLimitSnapshot(),
+  }
+
+  // A detected-but-unselected endpoint is worth one sentence, because the alternative is an
+  // operator guessing whether RAVEN is using the model they just started. It never changes `status`:
+  // an unselected provider cannot make a deployment more ready than it is.
+  if (localModel.reachable && !localModel.selected) {
+    body.note = `${body.note} A local OpenAI-compatible endpoint was detected at ${localModel.baseUrl} (${localModel.detail}) but is not selected — set RAVEN_PROVIDER=openai and RAVEN_BASE_URL=${localModel.baseUrl} to use it.`
   }
 
   return new Response(JSON.stringify(body, null, 2), {

@@ -50,7 +50,7 @@ const {
   isRavenState,
   transition,
 } = await import(`${ROOT}/lib/raven/states.ts`)
-const { classifyIntent } = await import(`${ROOT}/lib/raven/intent.ts`)
+const { classifyIntent, judgeReferent } = await import(`${ROOT}/lib/raven/intent.ts`)
 const { searchKnowledge, resetKnowledgeIndex, knowledgeDocuments } = await import(`${ROOT}/lib/raven/knowledge/index.ts`)
 const { findProject, contact: contactRecord, projects: corpusProjects, lookupGlossary } = await import(`${ROOT}/lib/raven/knowledge/corpus.ts`)
 const { createToolRegistry, TOOL_SPECS } = await import(`${ROOT}/lib/raven/tools/index.ts`)
@@ -255,7 +255,7 @@ await check('parameter bounds are enforced, not suggested', async () => {
 
 await check('a hung tool is cut off at its timeout and the turn survives', async () => {
   const sandbox = new ToolRegistry({ defaults: { timeoutMs: 120 } })
-  sandbox.register({ name: 'slow', description: 'test tool that never returns in time', permission: 'read', parameters: {} }, async () => {
+  sandbox.register({ name: 'slow', description: 'test tool that never returns in time', permission: 'read', deterministic: true, parameters: {} }, async () => {
     await new Promise((resolve) => setTimeout(resolve, 4000))
     return { output: { done: true } }
   })
@@ -266,7 +266,7 @@ await check('a hung tool is cut off at its timeout and the turn survives', async
 
 await check('oversized output is truncated with an explicit marker', async () => {
   const sandbox = new ToolRegistry({ defaults: { timeoutMs: 500, maxOutputChars: 200 } })
-  sandbox.register({ name: 'verbose', description: 'test tool that returns far too much text', permission: 'read', parameters: {} }, () => ({ output: { blob: 'y'.repeat(5000) } }))
+  sandbox.register({ name: 'verbose', description: 'test tool that returns far too much text', permission: 'read', deterministic: true, parameters: {} }, () => ({ output: { blob: 'y'.repeat(5000) } }))
   const outcome = await sandbox.execute({ tool: 'verbose', input: {} }, { sessionId: 's', conversationId: 'c', adapter: null, agentRunId: null, approvedActions: new Set(), now: () => new Date().toISOString(), config: ravenConfig() })
   assert.equal(outcome.status, 'succeeded')
   assert.equal(outcome.output.truncated, true)
@@ -275,7 +275,7 @@ await check('oversized output is truncated with an explicit marker', async () =>
 
 await check('a throwing tool becomes a failed run, never a crashed turn', async () => {
   const sandbox = new ToolRegistry({})
-  sandbox.register({ name: 'boom', description: 'test tool that throws on purpose', permission: 'read', parameters: {} }, async () => {
+  sandbox.register({ name: 'boom', description: 'test tool that throws on purpose', permission: 'read', deterministic: true, parameters: {} }, async () => {
     throw new Error('exploded inside the handler')
   })
   const outcome = await sandbox.execute({ tool: 'boom', input: {} }, { sessionId: 's', conversationId: 'c', adapter: null, agentRunId: null, approvedActions: new Set(), now: () => new Date().toISOString(), config: ravenConfig() })
@@ -729,6 +729,10 @@ await check('the agentic path also works with no provider at all', async () => {
   assert.equal(result.metadata.provider, null)
   assert.match(result.response, /no model was involved|no provider/i)
   assert.equal(result.verified, true)
+  // §12: the trace of a synthesis turn has to say that no synthesis happened, in as many words.
+  const synthesis = (result.metadata.trace ?? []).find((event) => event.phase === 'synthesis')
+  assert.ok(synthesis, 'the trace skipped the synthesis step entirely')
+  assert.match(synthesis.note, /no provider; composed deterministically/, `unexpected synthesis note: ${synthesis.note}`)
 })
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1145,123 @@ group('13. Final integration: context, ceilings, and the states a turn may claim
 const { resolveProjectReferent } = await import(`${ROOT}/lib/raven/intent.ts`)
 const { planAgentSteps } = await import(`${ROOT}/lib/raven/agents/reasoning.ts`)
 
+await check('an unresolvable follow-up asks which one instead of answering something else', async () => {
+  // §13. The dangerous version of this turn is the fluent one: a provider given evidence
+  // retrieved for a different question answers confidently, the verifier finds its claims
+  // supported by those records, and `verified:true` certifies a non-sequitur. Measured before the
+  // rule existed: "Tell me more about that one." → a cited paragraph about the RAG project.
+  const sessionId = `clarify-${Date.now()}`
+  const conversationId = `conv-${sessionId}`
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  let providerCalls = 0
+  const countingProvider = {
+    id: 'counted',
+    label: 'Counts attempts',
+    probe: async () => ({ reachable: true, detail: 'stub' }),
+    generate: async () => {
+      providerCalls++
+      return { ok: true, text: 'Riyan built the RAG Knowledge Assistant, which uses hybrid dense-sparse retrieval.', model: 'counted-1', provider: 'counted', ms: 1 }
+    },
+  }
+  await runBrainTurn({ message: 'What has Riyan built?', sessionId, conversationId }, { providerOverride: countingProvider })
+  // A first message that points at nothing is the same case: no referent, so no answer.
+  const cold = await runBrainTurn({ message: 'Tell me more about that one.', sessionId: `cold-${Date.now()}`, skipPersistence: true }, { providerOverride: countingProvider })
+  assert.equal(cold.success, true, 'a question is not a failure')
+  assert.equal(cold.metadata.intent, 'unknown')
+  assert.match(cold.response, /which one do you mean|no referent for me to resolve/i, `expected a clarification, got: ${cold.response.slice(0, 120)}`)
+  assert.equal(cold.citations.length, 0, 'a clarification must not wear the records it did not answer about')
+  assert.equal(cold.verified, false, 'a question makes no verifiable claim')
+  assert.equal(cold.mode, 'knowledge')
+  assert.ok(cold.metadata.trace.some((event) => event.phase === 'clarification'), 'the turn has to say that it asked for clarification')
+
+  const before = providerCalls
+  const vague = await runBrainTurn({ message: 'And how good is it?', sessionId, conversationId }, { providerOverride: countingProvider })
+  assert.ok(vague.response.length > 20, 'the turn still has to answer with something')
+  if (providerCalls > before) {
+    // If the referent resolved to a real project, the provider may be asked about *that* project.
+    assert.match(JSON.stringify(vague.metadata.trace), /anaphora|referent/i, 'a provider call on a follow-up has to be explained by a resolved referent')
+  } else {
+    assert.match(vague.response, /which one|could not tell/i, 'a follow-up that was not resolved must ask, not improvise')
+  }
+  // After a listing that named exactly one project, "it" is not ambiguous: it resolves.
+  const single = `single-${Date.now()}`
+  await runBrainTurn({ message: 'Tell me about the RAG Knowledge Assistant project', sessionId: single, conversationId: `c-${single}` }, { providerOverride: countingProvider })
+  const resolved = await runBrainTurn({ message: 'What technologies does it use?', sessionId: single, conversationId: `c-${single}` }, { providerOverride: countingProvider })
+  assert.equal(resolved.metadata.intent, 'portfolio.skills')
+  assert.equal(String(resolved.metadata.intentConfidence) !== '0.05', true)
+  assert.match(JSON.stringify(resolved.metadata.trace), /only project the last answers mentioned/, 'a one-candidate referent must be recorded, not silently used')
+  // …and the subject has to reach the engine that answers, not just the record of the turn.
+  assert.ok(resolved.metadata.toolsUsed.includes('get_project'), 'the plan never consulted the resolved project')
+  assert.match(resolved.response, /Python|LangChain|Vector Databases/, 'a project-scoped “what does it use” still answered from the site-wide skill graph')
+  assert.match(resolved.response, /not the site-wide skill list|different list/i, 'it has to say which of the two lists it read')
+  assert.ok(!/Agentic AI, Machine Learning, Deep Learning/.test(resolved.response), 'the whole-site focus list leaked into a project-scoped answer')
+})
+
+await check('the verification disclaimer is not attached to turns that made no claim', async () => {
+  // A greeting that failed verification reads as an outage report about "hi". The disclaimer now
+  // requires that the turn had something on the table: runs, citations, or retrieved evidence.
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  for (const message of ['hi', 'thanks!', 'nice']) {
+    const turn = await runBrainTurn({ message, sessionId: `phatic-${Date.now()}-${message}`, skipPersistence: true })
+    assert.equal(turn.success, true, `“${message}” must be answered, not refused`)
+    assert.ok(!/could not fully verify|treat it as unconfirmed/i.test(turn.response), `“${message}” picked up a verification disclaimer: ${turn.response}`)
+    assert.ok(!/grounded-mode-has-evidence/.test(turn.response), 'an internal check id has no business being in a sentence shown to a visitor')
+    assert.ok(JSON.stringify(turn.metadata.trace).includes('verification-disclaimer'), 'the choice to withhold it is itself worth recording')
+  }
+  // And the case the disclaimer exists for: an answer that did claim something, unverified.
+  const claiming = await runBrainTurn({ message: 'What has Riyan built?', sessionId: `claim-${Date.now()}`, skipPersistence: true })
+  assert.equal(claiming.verified, true, 'a grounded factual answer should stay verified')
+})
+
+await check('a design question about this portfolio goes to the agent, not to a refusal', async () => {
+  // §12: no document describes work that has not happened yet, but there *are* records to plan
+  // against when the question is about this repository. Refusing that is technically honest and
+  // useless; the agent retrieves what exists and says which records the plan stands on.
+  const { classifyIntent, judgeReferent } = await import(`${ROOT}/lib/raven/intent.ts`)
+  const aboutOurs = classifyIntent("Design a realistic architecture for adding authentication to Riyan's portfolio.")
+  assert.equal(aboutOurs.intent, 'unknown', 'no rule should claim a design question')
+  assert.equal(aboutOurs.entities.unanswerableByCorpus, 'hypothetical')
+  assert.equal(aboutOurs.entities.aboutThisPortfolio, 1, 'the question names this body of work, and that has to travel to the router')
+  const aboutYours = classifyIntent('Suggest a CLI architecture for my next project.')
+  assert.equal(aboutYours.entities.aboutThisPortfolio, undefined, 'an imaginary project is not this portfolio')
+
+  const { routeTurn } = await import(`${ROOT}/lib/raven/router.ts`)
+  const route = routeTurn({ intent: aboutOurs, capabilities: { providerAvailable: false, knowledgeAvailable: true, databaseAvailable: true, providerKnownFailing: false } })
+  assert.equal(route.mode, 'agentic', `expected the agent to take a design question about these records, got ${route.mode}`)
+  assert.match(route.reasons.join(' '), /planned against them/)
+  const noCorpus = routeTurn({ intent: aboutOurs, capabilities: { providerAvailable: false, knowledgeAvailable: false, databaseAvailable: false, providerKnownFailing: false } })
+  assert.notEqual(noCorpus.mode, 'agentic', 'with no corpus there is nothing to plan against')
+
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const offline = await runBrainTurn({ message: "Design a realistic architecture for adding authentication to Riyan's portfolio.", sessionId: `design-${Date.now()}`, skipPersistence: true })
+  assert.equal(offline.success, true, 'the turn answered from the records it retrieved, so it is not a failure')
+  assert.equal(offline.mode, 'agentic', `mode=${offline.mode}`)
+  assert.equal(offline.provider, 'none', 'no model ran, and the response must not imply one did')
+  assert.equal(offline.degraded?.from, 'genai', 'the missing synthesis step has to be named')
+  assert.ok(offline.tools.length > 0, 'the agent must have actually consulted something')
+  assert.ok(offline.citations.length > 0, 'a deterministic plan still cites the records it read')
+})
+
+await check('memories are injected for relevance, and the importance fallback is only for phatic turns', async () => {
+  // §8: "unrelated memories must not leak into prompts". The fallback that carries the top facts
+  // when a search matched nothing exists so "hi" still knows who it is talking to — for a
+  // substantive question, an unmatched search means *unmatched*, and importing a 0.9-importance
+  // preference anyway is the leak the brief names.
+  const { createMemoryDatabase } = await import(`${ROOT}/lib/raven/db/memoryStore.ts`)
+  const { loadContext } = await import(`${ROOT}/lib/raven/memory/service.ts`)
+  const adapter = createMemoryDatabase()
+  const now = new Date().toISOString()
+  await adapter.remember({ id: 'mm1', sessionId: 'rel', key: 'preference.language', value: 'Prefers Rust for CLI tools', importance: 0.9, source: 'explicit', createdAt: now, updatedAt: now })
+  const config = ravenConfig()
+  const limits = { maxHistoryMessages: config.limits.maxHistoryMessages, maxMemoriesInContext: config.limits.maxMemoriesInContext }
+  const unrelated = await loadContext({ adapter, sessionId: 'rel', conversationId: 'c', message: 'How does Riyan deploy the Kubernetes operators?', limits })
+  assert.equal(unrelated.memories.length, 0, `an unrelated question imported ${unrelated.memories.length} memory row(s) it had no term for`)
+  const related = await loadContext({ adapter, sessionId: 'rel', conversationId: 'c', message: 'Which language should my CLI use?', limits })
+  assert.ok(related.memories.some((memory) => /Rust/.test(memory.value)), 'a question the memory answers must still receive it')
+  const phatic = await loadContext({ adapter, sessionId: 'rel', conversationId: 'c', message: 'hi', limits })
+  assert.ok(phatic.memories.length > 0, 'the greeting case is what the fallback exists for')
+})
+
 await check('the two documented timeout budgets actually bound a turn', async () => {
   // RAVEN_AGENT_STEP_TIMEOUT_MS and RAVEN_AGENT_TURN_TIMEOUT_MS were read out of the environment and
   // then never referenced: the numbers in `.env.example` bound nothing, and anything that stalled
@@ -1152,7 +1273,7 @@ await check('the two documented timeout budgets actually bound a turn', async ()
   const base = ravenConfig()
 
   const sandbox = new ToolRegistry({ defaults: { timeoutMs: 4000, maxTimeoutMs: 120 } })
-  sandbox.register({ name: 'slow_but_confident', description: 'asks for a timeout the ceiling refuses to grant', permission: 'read', parameters: {}, timeoutMs: 3000 }, async () => {
+  sandbox.register({ name: 'slow_but_confident', description: 'asks for a timeout the ceiling refuses to grant', permission: 'read', deterministic: true, parameters: {}, timeoutMs: 3000 }, async () => {
     await new Promise((resolve) => setTimeout(resolve, 3000))
     return { output: { said: 'too late' } }
   })
@@ -1231,7 +1352,98 @@ await check('a follow-up is resolved from the previous answer instead of refused
   // And the negative half: the same words with no previous answer must NOT invent a subject.
   const cold = await runBrainTurn({ message: 'Which one uses RAG?', sessionId: `cold-${Date.now()}`, conversationId: 'cold-conv' })
   assert.notEqual(cold.metadata.intent, 'portfolio.project', 'a referential question was answered from nothing')
-  assert.equal(cold.success, false, 'a follow-up with no antecedent should be an honest refusal')
+  // §13 allows either an honest refusal or a question back; a question is the better answer here,
+  // because the visitor can act on it. What must not happen is an answer that invents a subject.
+  assert.match(cold.response, /which one do you mean|no referent for me to resolve/i, `expected a clarification, got: ${cold.response.slice(0, 140)}`)
+  assert.equal(cold.citations.length, 0, 'a clarification must not cite the records it said nothing about')
+  assert.equal(cold.verified, false, 'a question has no claims to verify')
+})
+
+await check('a tool that does not declare determinism cannot be registered', () => {
+  // §6 is a contract about every tool, so the registry enforces it rather than trusting the list.
+  const sandbox = new ToolRegistry({ defaults: { timeoutMs: 100 } })
+  assert.throws(
+    () => sandbox.register({ name: 'unlabelled', description: 'forgets to say', permission: 'read', parameters: {} }, () => ({ output: {} })),
+    /must declare deterministic/,
+    'an unlabelled tool was accepted, so the label is optional in practice',
+  )
+  sandbox.register({ name: 'labelled', description: 'says it', permission: 'read', deterministic: true, parameters: {} }, () => ({ output: { ok: true } }))
+  assert.ok(sandbox.names().includes('labelled'))
+})
+
+await check('a clock time in a sentence is not a project number', () => {
+  // Measured live: "Remember that my canary release window is Thursday 02:00." was answered with
+  // the card for project 02 — the user's write was confirmed by nothing, and a project they never
+  // named was described back to them. A bare digit needs an anchor; an anchored one still works.
+  const remember = classifyIntent('Remember that my canary release window is Thursday 02:00.')
+  assert.equal(remember.entities.project, undefined, `a time was read as a project: ${JSON.stringify(remember.entities)}`)
+  assert.equal(remember.intent, 'memory.remember', 'the write has to be recognised as the request it is')
+  for (const phrase of ['tell me about project 3', 'what does #2 do', 'open card 01', 'project 04 please'])
+    assert.ok(String(classifyIntent(phrase).entities.project ?? '').length > 0, `“${phrase}” no longer names a project`)
+})
+
+await check('a stored fact answers a question the corpus cannot — and says where it came from', async () => {
+  // §8 asked for durable facts to be usable, not just writable. Measured before this branch existed:
+  // the store returned the row (`retrieved:1`) and the turn still answered 502, because every
+  // composer reads the repository's records and nothing reads the memory table. The answer is
+  // labelled as the user's own fact, cites the row, and does not pass itself off as portfolio data.
+  const { runBrainTurn } = await import(`${ROOT}/lib/raven/brain.ts`)
+  const sessionId = `mem-answer-${Date.now()}`
+  const conversationId = `c-${sessionId}`
+  await runBrainTurn({ message: 'Remember that my deployment port is 4109 and my staging host is alpha.', sessionId, conversationId })
+  const asked = await runBrainTurn({ message: 'What is my deployment port and staging host?', sessionId, conversationId })
+  assert.equal(asked.success, true, `§8: a stored fact was retrieved and then refused: ${asked.response.slice(0, 90)}`)
+  assert.match(asked.response, /4109/)
+  assert.match(asked.response, /alpha/)
+  assert.match(asked.response, /your own stored fact|not portfolio data/i, 'it has to name the source of the number')
+  const memoryCitation = asked.citations.find((citation) => citation.kind === 'memory')
+  assert.ok(memoryCitation, 'a memory answer must cite the memory row it read')
+  assert.match(String(memoryCitation.source), /^memory:/)
+  assert.equal(asked.verified, true, 'a quoted store value is evidence, so the turn is verifiable')
+  assert.ok(asked.metadata.trace.some((event) => event.phase === 'memory-answer'), 'the trace has to show the memory answered it')
+
+  // And the negative halves: one shared word is not a match, and no match is still a refusal.
+  const collision = await runBrainTurn({ message: 'What is my kubernetes operator port?', sessionId, conversationId })
+  assert.ok(!/4109/.test(collision.response), `an unrelated question was answered from a memory sharing one word: ${collision.response.slice(0, 120)}`)
+  const otherSession = await runBrainTurn({ message: 'What is my deployment port and staging host?', sessionId: `nobody-${Date.now()}`, skipPersistence: true })
+  assert.ok(!/4109/.test(otherSession.response), 'a fact leaked across sessions')
+})
+
+await check('“it” attaches to the last answer before it searches further back', () => {
+  // Three answers ago RAVEN listed five projects; the answer immediately before the follow-up was
+  // about one of them. Reading a blended window finds five candidates, calls the reference
+  // ambiguous, and answers about everything instead of the thing in front of both parties.
+  const recent = [
+    { role: 'raven', content: '5 project(s) on this portfolio: Akshara Deepa Tutor, Sign Language Detector, RAG Knowledge Assistant, Agentic AI Project, Data Science Project.' },
+    { role: 'raven', content: 'Focus areas declared on the skills section: AI, Data Science.' },
+    { role: 'raven', content: 'RAG Knowledge Assistant (03) — RETRIEVAL / AI, status TESTING.' },
+  ]
+  const direct = judgeReferent('What technologies does it use?', recent)
+  assert.equal(direct.resolved?.name, 'RAG Knowledge Assistant', `“it” should attach to the last answer, got ${JSON.stringify(direct.resolved)}`)
+  assert.equal(direct.resolved?.how, 'single-candidate')
+  // An answer that names nothing is the one case where widening the window is correct.
+  const vague = judgeReferent('And the second one?', [
+    { role: 'raven', content: 'Sure. Ask me about the projects.' },
+    { role: 'raven', content: 'Two records matched: Sign Language Detector and RAG Knowledge Assistant.' },
+  ])
+  assert.equal(vague.resolved?.name, 'RAG Knowledge Assistant', 'the ordinal still points into the most recent listing')
+  assert.equal(vague.followUpShaped, true)
+})
+
+await check('a comparison naming two positions binds both of them', () => {
+  // §13's example list ends with “Compare the first and third projects.” One name is a partial
+  // answer to that sentence and a different question wearing it, so either every position resolves
+  // or none does.
+  const recent = [{ role: 'raven', content: '5 project(s): Akshara Deepa Tutor, Sign Language Detector, RAG Knowledge Assistant, Agentic AI Project, Data Science Project.' }]
+  const pair = judgeReferent('Compare the first and third projects.', recent)
+  assert.equal(pair.followUpShaped, true)
+  assert.equal(pair.resolved?.name, 'Akshara Deepa Tutor', `“the first” resolved to “${pair.resolved?.name}”`)
+  assert.deepEqual(pair.alsoResolved, ['RAG Knowledge Assistant'], 'the third item was not carried alongside the first')
+  assert.match(pair.resolved?.note ?? '', /3 positions|2 positions/, 'the note should say how many positions were resolved')
+  const outOfRange = judgeReferent('Compare the first and ninth projects.', recent)
+  assert.equal(outOfRange.resolved, null, 'a ninth project does not exist in a five-item list, and half a comparison is not an answer')
+  assert.equal(outOfRange.reason, 'out-of-range-ordinal')
+  assert.equal(outOfRange.candidates.length, 5, 'the refusal should still know what was on offer')
 })
 
 await check('the referent resolver abstains rather than guessing', async () => {
@@ -1269,6 +1481,10 @@ await check('every tool is registered, bounded, and cannot touch the machine', a
     const spec = entry.spec
     assert.ok(['read', 'compute', 'action'].includes(spec.permission), `${spec.name} declares permission ${spec.permission}`)
     assert.ok(typeof spec.timeoutMs === 'number' && spec.timeoutMs > 0 && spec.timeoutMs <= 8000, `${spec.name} has no usable timeout`)
+    // §6: determinism is a declared property, not a guess by the caller — the agent is allowed to
+    // reuse one answer per turn only for tools that promise it.
+    assert.equal(typeof spec.deterministic, 'boolean', `${spec.name} does not declare whether it is deterministic`)
+    if (spec.permission === 'action') assert.equal(spec.deterministic, false, `${spec.name} writes, so it cannot promise the same output twice`)
     assert.ok(!forbidden.test(`${spec.name} ${spec.description}`), `${spec.name} advertises machine access, which this backend does not have`)
     if (spec.permission === 'action') {
       const touchesThePage = spec.name === 'request_navigation'

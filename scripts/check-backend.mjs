@@ -578,6 +578,130 @@ await check('JSON extraction survives fences and prose wrappers', () => {
   assert.equal(cleanReply('RAVEN: hello\n'), 'hello')
 })
 
+await check('a short id is honoured, and the header says when it was not', async () => {
+  // Both bugs this pins were measured live: a 4-character session header was re-minted on every
+  // request, so a memory written under one random id was read from the next — a store that
+  // appeared to lose data with no error anywhere. The floor is now 3 characters, and the source
+  // the server used is a response header instead of a mystery.
+  const call = async (headers) => {
+    const response = await ravenRoute.POST(
+      new Request('http://localhost/api/raven', { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ message: 'Remember that the deployment port is 4109.' }) }),
+    )
+    return { status: response.status, source: response.headers.get('x-raven-session-source'), conversation: response.headers.get('x-raven-conversation-source'), body: await response.json() }
+  }
+  const short = await call({ 'x-raven-session': 'p13' })
+  assert.equal(short.status, 200)
+  assert.equal(short.source, 'header', 'a three-character session header was rejected, so the next turn forgets it')
+  const same = await call({ 'x-raven-session': 'p13' })
+  assert.match(JSON.stringify(same.body.memory), /"stored":1/, 'no memory accounting on a turn that stored one')
+  assert.equal(same.source, 'header')
+  const junk = await call({ 'x-raven-session': '  ?? ??  ' })
+  assert.equal(junk.status, 200, 'an unusable id must not fail the turn')
+  assert.equal(junk.source, 'generated', 'the response does not say that the caller\u2019s id was replaced')
+  assert.equal(junk.conversation, 'generated')
+  assert.ok(/^[A-Za-z0-9_-]{3,64}$/.test(String(junk.body.conversationId)), 'the minted id does not match the documented shape')
+})
+
+await check('a client-supplied conversation id is honoured, or replaced in the response', async () => {
+  // The failure mode this pins down is silent amnesia: an id that fails validation is swapped for a
+  // fresh one, so the next turn has no history and nothing errored. Short ids must therefore be
+  // usable, and when one genuinely cannot be honoured the response has to say which id it used.
+  const send = async (conversationId) => {
+    const response = await ravenRoute.POST(
+      new Request('http://localhost/api/raven', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'What has Riyan built?', conversationId }) }),
+    )
+    return { status: response.status, body: await response.json() }
+  }
+  const short = await send('p13')
+  assert.equal(short.status, 200)
+  assert.equal(short.body.conversationId, 'p13', 'a three-character id was replaced, so the follow-up turn would forget it')
+  const followUp = await send('p13')
+  assert.ok(JSON.stringify(followUp.body.metadata.trace).includes('prior message'), 'the second turn in the same conversation saw no history')
+  const silly = await send('  ???  ')
+  assert.equal(silly.status, 200, 'an unusable id must not fail the turn')
+  assert.ok(!/[?\s]/.test(silly.body.conversationId), `an unvalidated id reached the response: ${silly.body.conversationId}`)
+  assert.notEqual(silly.body.conversationId, '???', 'the rejected value must not be echoed back as if it were the conversation')
+})
+
+await check('health publishes the breaker by name and a local model it did not adopt', async () => {
+  // §20 asks for `breaker:{state,cooldown}`. `{open, openForMs}` says the same thing to a reader
+  // who already knows the module, and nothing to a reader who does not, so both views ship.
+  // The local-model block is §4: a detected endpoint is reported as detected, with the setting
+  // that would adopt it — never as "in use".
+  const response = await healthRoute.GET(new Request('http://localhost/api/health'))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(typeof body.breaker, 'object', '/api/health stopped publishing the breaker block')
+  assert.ok(['open', 'closed'].includes(body.breaker.state), `unexpected breaker state: ${body.breaker.state}`)
+  assert.equal(typeof body.breaker.cooldownMs, 'number', 'an open breaker has to say how long is left')
+  assert.deepEqual(body.provider.breaker ? Object.keys(body.provider.breaker).sort() : [], ['failures', 'open', 'openForMs', 'threshold'].sort(), 'the detailed view drifted')
+
+  assert.equal(typeof body.localModel, 'object', '/api/health stopped reporting whether a local model exists')
+  assert.equal(typeof body.localModel.probed, 'boolean')
+  assert.equal(typeof body.localModel.baseUrl, 'string')
+  assert.ok(!/127\.0\.0\.1:11434/.test(JSON.stringify(body.provider)), 'the unselected probe address leaked into the configured provider block')
+  if (body.localModel.reachable && !body.localModel.selected) assert.match(body.localModel.hint ?? '', /RAVEN_BASE_URL/, 'a reachable unselected endpoint has to say how to adopt it')
+  if (!body.localModel.reachable) assert.equal(body.localModel.authorized, null, 'an unreachable address cannot have refused anything')
+  // The name of a key's environment variable is documentation and belongs here; the value does not.
+  const serialized = JSON.stringify(body)
+  assert.ok(!/"(apiKey|api_key|key|token|secret|authorization)":\s*"/i.test(serialized), 'health serialized a credential field with a value in it')
+  assert.ok(!/Bearer\s+[A-Za-z0-9._-]{8,}/.test(serialized), 'health echoed an authorization header')
+
+  // Every tool the console can see also carries its determinism label.
+  assert.ok(Array.isArray(body.tools) && body.tools.length > 0, 'the tool table vanished from health')
+  assert.ok(body.tools.every((tool) => typeof tool.deterministic === 'boolean'), 'a tool was listed without declaring whether it is deterministic')
+})
+
+await check('every variable documented in .env.example is actually read somewhere', async () => {
+  // The bug this prevents is the quiet one: a knob documented in `.env.example` that nothing reads.
+  // It looks configurable, it gets set, it is believed — and it does nothing. Checked across the
+  // whole backend rather than only config.ts, because a few of these are legitimately read where
+  // they are used (the session secret, the Supabase REST settings, the voice key, the cost rate).
+  const { readFile, readdir } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const sources = []
+  for (const dir of ['lib', 'app', 'scripts', 'components']) {
+    const walk = async (path) => {
+      for (const entry of await readdir(path, { withFileTypes: true })) {
+        const full = join(path, entry.name)
+        if (entry.isDirectory()) await walk(full)
+        else if (/\.(ts|tsx|mjs)$/.test(entry.name)) sources.push(await readFile(full, 'utf8'))
+      }
+    }
+    await walk(dir)
+  }
+  const corpus = sources.join('\n')
+  const example = await readFile('.env.example', 'utf8')
+  const documented = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]+)=/gm)].map((match) => match[1])
+  assert.ok(documented.length > 12, `the scan found only ${documented.length} documented variables; the parser is broken`)
+  // Any of the three ways this codebase reaches the environment counts as "read": the config
+  // helpers (`env('X')`, `int('X', …)`), a direct `process.env.X`, or a bracket lookup.
+  const readSomewhere = (name) =>
+    corpus.includes(`'${name}'`) || corpus.includes(`"${name}"`) || corpus.includes(`process.env.${name}`) || corpus.includes(`process.env['${name}']`)
+  const unread = documented.filter((name) => !readSomewhere(name))
+  assert.deepEqual(unread, [], `.env.example documents variables nothing reads: ${unread.join(', ')}`)
+})
+
+await check('a detected local model is reported as detected, never as used', async () => {
+  // §4: a zero-cost local endpoint may be *found*, but a deployment must not start sending user
+  // questions to whatever happens to be listening on localhost. `selected` is the line between the
+  // two, and an unreachable address has to say so instead of leaving "false" to be read as a refusal.
+  const { detectLocalProvider, clearProviderProbeCaches } = await import(`${ROOT}/lib/raven/providers/index.ts`)
+  const base = ravenConfig()
+  clearProviderProbeCaches()
+  const closed = await detectLocalProvider({ ...base, provider: { ...base.provider, localProbeUrl: 'http://127.0.0.1:9/v1', localProbeTimeoutMs: 400 } })
+  assert.equal(closed.probed, true)
+  assert.equal(closed.reachable, false, 'nothing on that port must not be reported as reachable')
+  assert.equal(closed.selected, false)
+  assert.equal(closed.authorized, null, 'an endpoint that never answered has not judged any credential')
+  assert.match(closed.detail, /nothing is listening/, `unexpected detail: ${closed.detail}`)
+  clearProviderProbeCaches()
+  const skipped = await detectLocalProvider({ ...base, provider: { ...base.provider, localProbeUrl: 'http://127.0.0.1:9/v1' } }, { probe: false })
+  assert.equal(skipped.probed, false)
+  assert.equal(skipped.reachable, false)
+  clearProviderProbeCaches()
+})
+
 await check('a timeout costs one attempt; a 5xx may use the retry budget', async () => {
   // A hang is not the same as a 500. The endpoint already failed to answer inside the time we
   // gave it, so trying again multiplies the wait the user is watching (live: 3 × RAVEN_TIMEOUT_MS

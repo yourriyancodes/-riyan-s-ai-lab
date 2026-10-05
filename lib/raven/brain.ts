@@ -15,7 +15,8 @@
  *    error code. A portfolio backend that 500s on a clever question is a broken demo.
  */
 import { ravenConfig, type RavenConfig } from './config'
-import { classifyIntent, resolveProjectReferent } from './intent'
+import { classifyIntent, judgeReferent } from './intent'
+import { tokenize } from './knowledge/search'
 import { routeTurn, type RouterCapabilities } from './router'
 import { transition, WORKING_STATES } from './states'
 import { providerBreakerState, recordProviderFailure, recordProviderSuccess } from './breaker'
@@ -209,6 +210,9 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     truncated: boolean
     error?: { code: string; message: string; retryAfterMs?: number }
   }): RavenResponse => {
+    // Positional ids for every step record, whoever produced it — retrieval, verification, the
+    // agent loop, provider attempts. An id is only useful if it exists on all of them.
+    for (const [index, step] of stepRecords.entries()) if (!step.id) step.id = `step-${index + 1}`
     const trace = [...tracker.events]
     if (tracker.refusals.length) trace.push({ state: parts.state, phase: 'transition-guard', atMs: tracker.elapsed(), ms: 0, note: tracker.refusals.join('; ') })
     const degraded = parts.route.degradedFrom
@@ -357,21 +361,75 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     // experiences as continuous. Resolution is attempted only when the message on its own
     // would have been refused anyway, so it can never overwrite a question that already has an
     // intent, and it can only name something the previous answer actually said.
+    // A follow-up carries its subject in the *previous answer*, not in itself. "Which one uses
+    // RAG?" after a project listing is a precise question, and answering it as an isolated query —
+    // which a one-string classifier is right to do — wastes a turn the user experiences as
+    // continuous. Resolution can only name something the recent answers actually said. It never
+    // overrules a question that has its own subject; when the intent is confident but the subject
+    // is missing, it *supplies* one, so "What technologies does it use?" is answered about the
+    // project in front of both parties rather than about every skill on the page.
+    //
+    // When the message points at something and nothing in this conversation matches, the honest
+    // move is to ask which one. Not to answer the closest thing retrieval found, and not to hand a
+    // provider evidence retrieved for a different question: measured before this rule existed,
+    // "Tell me more about that one." produced a fluent, cited, `verified:true` paragraph about a
+    // project nobody had named. Grounding was satisfied. The answer was still wrong.
     let retrievalText = message
-    if (context.recent.length && (resolved.intent === 'unknown' || resolved.confidence < 0.35)) {
-      const referent = resolveProjectReferent(message, context.recent)
-      if (referent) {
-        const withContext = classifyIntent(`${message} ${referent.name}`, classifyOptions)
+    const referent = judgeReferent(message, context.recent)
+    const weakIntent = resolved.intent === 'unknown' || resolved.confidence < 0.35
+    const missingSubject = !String(resolved.entities?.project ?? '').trim()
+    if (referent.resolved) {
+      const names = [referent.resolved.name, ...referent.alsoResolved]
+      const subjectText = `${message} ${names.join(' and ')}`
+      const entities = { project: names[0]!, ...(referent.alsoResolved.length ? { projectAlso: referent.alsoResolved.join(', ') } : {}) }
+      if (weakIntent) {
+        const withContext = classifyIntent(subjectText, classifyOptions)
         if (withContext.intent !== 'unknown') {
-          resolved = {
-            ...withContext,
-            entities: { ...withContext.entities, project: referent.name },
-            signals: [...withContext.signals, `anaphora:${referent.how}`],
-          }
-          retrievalText = `${message} ${referent.name}`
-          tracker.push('anaphora', undefined, referent.note)
+          resolved = { ...withContext, entities: { ...withContext.entities, ...entities }, signals: [...withContext.signals, `anaphora:${referent.resolved.how}`] }
         }
+      } else if (missingSubject) {
+        resolved = { ...resolved, entities: { ...resolved.entities, ...entities }, signals: [...resolved.signals, `referent:${referent.resolved.how}`] }
       }
+      // Retrieval follows the resolved subject even when the intent was already confident — the
+      // whole point of knowing which project is meant is that the tools get asked about it.
+      retrievalText = subjectText
+      tracker.push('anaphora', undefined, referent.resolved.note)
+    } else if (referent.followUpShaped && weakIntent) {
+      // Gated on `weakIntent` on purpose. "Compare the projects and tell me which one is closest to
+      // production" contains a pointer and is a complete question — the classifier knows it, so
+      // interrupting with "which one?" would be a refusal to read the sentence in front of us. The
+      // clarification belongs where the turn would otherwise have been guessed at or refused:
+      // nothing matched, and the only thing missing is the subject.
+      const choices = referent.candidates.slice(0, 4)
+      const answer = choices.length
+        ? `Which one do you mean — ${choices.join(', ')}? Say the name (or the number from the list) and I will answer from that record.`
+        : `Nothing in this conversation is called “it”, “that one”, or an order I can match, so there is no referent for me to resolve. Ask about one of the five projects, the skills, the experiments, or how this backend works.`
+      tracker.push('clarification', undefined, `follow-up with no resolvable referent (${referent.reason ?? 'no candidates'})`)
+      tracker.enter('SPEAKING', 'clarification', `asked which of ${choices.length || 0} candidate(s) was meant`)
+      // Returned before the router, so the payload has to say so itself: no tools ran, no provider
+      // was asked, nothing was retrieved, and `verified:false` because a question makes no claim.
+      return respond({
+        ...base,
+        success: true,
+        response: answer,
+        mode: 'knowledge',
+        state: 'SPEAKING',
+        verified: false,
+        intent: resolved.intent,
+        intentConfidence: resolved.confidence,
+        inputChars: message.length,
+        contextChars: contextChars(context),
+        database: databaseMeta,
+        conversationSource: sourceOf(context.source),
+        memory: { retrieved: context.memories.length, stored: 0 },
+        route: {
+          mode: 'knowledge',
+          usedKnowledge: false,
+          usedProvider: false,
+          usedTools: false,
+          reasons: [`the message pointed at an earlier answer that could not be resolved (${referent.reason ?? 'no candidates'}); asked which one instead of retrieving or synthesising`],
+        },
+      })
     }
     const intent = resolved
 
@@ -447,10 +505,15 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     for (const [index, call] of retrieval.calls.entries()) {
       const outcome = retrieval.outcomes.get(call.tool)
       stepRecords.push({
+        id: `step-${stepRecords.length + 1}`,
         action: `${call.tool} — ${plan.rationale[index] ?? 'planned retrieval'}`,
         tool: call.tool,
         status: outcome?.status ?? 'skipped',
         ms: outcome?.ms ?? 0,
+        // The run is the record with `input`/`output` on it; the step is the label beside it. One
+        // id links the two so a reader can go from "step-3 failed" to the row that says why, which
+        // is the point of §5's per-step fields without duplicating the payload into the transcript.
+        ...(outcome?.run ? { runId: outcome.run.id } : {}),
         ...(outcome?.error ? { note: clip(outcome.error, 160) } : {}),
       })
     }
@@ -556,6 +619,19 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         stepRecords.push({ action: 'agent turn', status: raced.kind === 'over' ? 'timeout' : 'failed', ms: budgetMs, note: degradedBecause })
       } else {
         const agentic = raced.agentic
+        // Who spoke, in the trace as well as in the step list: `provider` in the response says
+        // which endpoint answered, and this says what the agent did about it — used it, was
+        // refused, found nothing configured, or found it on cooldown. Without this the trace of a
+        // synthesis turn looks identical to a deterministic one until a reader diffs the citations.
+        tracker.push(
+          'synthesis',
+          undefined,
+          agentic.synthesizedBy === 'provider'
+            ? `provider ${agentic.provider?.id ?? 'unknown'} composed the answer over ${citations.length} retrieved record(s)`
+            : agentic.providerFailure
+              ? `provider ${agentic.providerFailure.code}; composed deterministically from the same evidence`
+              : 'no provider; composed deterministically from retrieved evidence',
+        )
         answer = agentic.answer
         citations = agentic.citations
         providerMeta = agentic.provider
@@ -635,6 +711,45 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       mode = 'knowledge'
     }
 
+    // A durable fact the user handed this session is evidence too: it lives in the store, it is
+    // theirs, and it can be quoted back with its key and date. Before this branch, the brain refused
+    // a question *while holding the memory that answers it* (measured: "Remember that the deployment
+    // port is 4109." then "What is the deployment port I mentioned?" → memory retrieved 1, turn
+    // answered 502) because every composer reads only the repository's own records. The sentence
+    // below says plainly that the source is the user's stored fact and that the corpus has nothing,
+    // so a memory can never be mistaken for a claim about Riyan's data.
+    let memoryEvidence = ''
+    if (!answer && context.memories.length) {
+      const wanted = new Set(tokenize(message))
+      const scored = context.memories
+        .map((memory) => ({ memory, hits: tokenize(`${memory.key} ${memory.value}`).filter((term) => wanted.has(term)).length }))
+        .sort((a, b) => b.hits - a.hits)
+      const best = scored[0]
+      // One shared word is not a match, except when the question *is* one word plus stopwords.
+      // Without the floor, "what is my kubernetes operator port?" would happily be answered by a
+      // stored fact that only shares the word "port" — the same near-miss class the corpus composer
+      // refuses, applied to the memory side.
+      const strongEnough = best ? best.hits >= 2 || (best.hits >= 1 && wanted.size <= 2) : false
+      if (best && strongEnough) {
+        const value = clip(String(best.memory.value), 300)
+        const when = String(best.memory.updatedAt ?? best.memory.createdAt ?? '').slice(0, 10)
+        answer = `You asked me to remember this: “${value}”. That is your own stored fact${when ? ` (updated ${when})` : ''}, kept in the ${context.source} store under “${best.memory.key}”. It is not portfolio data, and nothing in the repository speaks to it.`
+        citations.push({
+          kind: 'memory',
+          source: `memory:${best.memory.key}`,
+          label: `Durable memory “${best.memory.key}”${when ? ` · ${when}` : ''}`,
+          locator: `${context.source} store, session-scoped`,
+          quote: value,
+        })
+        // The quote has to be part of the evidence the verifier reads, or the number inside it is
+        // "unsupported" — which would be true of the corpus and false of the turn.
+        memoryEvidence = value
+        mode = 'knowledge'
+        tracker.push('memory-answer', undefined, `answered from 1 of ${context.memories.length} stored fact(s); nothing in the corpus matched`)
+        stepRecords.push({ action: 'read durable memory', status: 'succeeded', ms: 0, note: `matched “${best.memory.key}” on ${best.hits} of ${wanted.size} question term(s)` })
+      }
+    }
+
     // Nothing grounded: say so instead of generating something.
     if (!answer) {
       tracker.enter('OFFLINE', 'no-evidence', `intent ${intent.intent}, ${retrieval.outcomes.size} tool(s) consulted`)
@@ -698,13 +813,14 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       tracker.push('verification', undefined, 'nothing retrieved and nothing claimed, so only the answer-presence rules apply')
     }
     const evidenceText = [
+      memoryEvidence,
       ...retrieval.citations.map((citation) => citation.quote ?? ''),
       ...[...retrieval.outcomes.values()].map((outcome) => JSON.stringify(outcome.output ?? '').slice(0, 4000)),
     ].join('\n')
     const verification = verifyAnswer({ answer, mode, intent, citations, runs, evidenceText, actions: memoryResult.actions, provider: providerMeta })
     for (const check of verification.checks) {
       if (!check.ok || !check.blocking) {
-        stepRecords.push({ action: `verify ${check.name}`, status: check.ok ? 'succeeded' : check.blocking ? 'failed' : 'skipped', ms: 0, note: check.note })
+        stepRecords.push({ id: `step-${stepRecords.length + 1}`, action: `verify ${check.name}`, status: check.ok ? 'succeeded' : check.blocking ? 'failed' : 'skipped', ms: 0, note: check.note })
       }
     }
     tracker.push('verification-report', undefined, summarizeVerification(verification))
@@ -726,7 +842,15 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         tracker.push('re-verification', undefined, summarizeVerification(recheck))
       } else {
         const offenders = verification.checks.filter((check) => !check.ok && check.blocking).map((check) => check.name)
-        finalAnswer = `${answer}\n\nI could not fully verify that against the retrieved evidence (${offenders.join(', ')}), so treat it as unconfirmed.`
+        // Only append the disclaimer when the turn actually had claims on the table. A greeting
+        // and a "noted" are not unverified facts — they are not facts — and telling a user that
+        // "RAVEN online" failed verification is worse than saying nothing: it advertises a
+        // problem in the one place the reader cannot check it. The check ids stay in the trace as
+        // `verify <name>` steps, where they are a diagnostic, and out of the prose, where the
+        // identifier is noise.
+        const hadClaims = runs.length > 0 || citations.length > 0 || evidenceText.trim().length > 0
+        if (hadClaims) finalAnswer = `${answer}\n\nI could not fully verify that against the retrieved evidence, so treat it as unconfirmed.`
+        tracker.push('verification-disclaimer', undefined, hadClaims ? `appended for ${offenders.join(', ')}` : `withheld: no claims to verify (${offenders.join(', ') || 'no blocking checks'})`)
       }
     }
 

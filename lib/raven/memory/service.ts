@@ -61,9 +61,12 @@ export async function loadContext(input: {
     const terms = recallTerms(input.message)
     const found = terms.length ? await input.adapter.searchMemories(input.sessionId, terms, input.limits.maxMemoriesInContext) : []
     memories = found
-    if (!found.length) {
-      // Fallback: the most important facts the session owns, so "hi" still carries the
-      // context of who the user told RAVEN they are.
+    // The importance fallback exists for one shape: a message with no content words at all
+    // ("hi", "thanks"), where the useful context is knowing who the user said they are. It must
+    // not fire for a *substantive* question that simply matched nothing — that is how "I prefer
+    // Rust" ends up in a prompt about Kubernetes, which reads as relevance the system never found.
+    // So the test is "no terms to search with", not "no rows came back".
+    if (!found.length && !terms.length) {
       memories = await input.adapter.recallMemories(input.sessionId, Math.max(3, Math.floor(input.limits.maxMemoriesInContext / 2)))
     }
   } catch (error) {

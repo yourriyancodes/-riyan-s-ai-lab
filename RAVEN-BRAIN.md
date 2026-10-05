@@ -172,6 +172,65 @@ somewhere in `npm run check`:
 
 ---
 
+### 1.4 Audit pass: eleven findings from driving it instead of reading it
+
+The follow-up brief asked for an audit of eighteen areas against the running system before any
+change. Baseline: 428 checks green, `tsc` clean, `build` clean — and the audit still found eleven
+defects, each now fixed and asserted. `RAVEN-AUDIT.md` holds the area-by-area record with the
+measurements; the summary of what was wrong:
+
+1. **A clock time was a project number.** "Remember that my canary release window is Thursday
+   02:00" → `findProject('02')` → the Sign Language Detector card, and the write was never
+   confirmed to the user. A bare digit needs an anchor ("project 3", "card 01", "#2"); anchored
+   forms still resolve, phone numbers and "item 3 of the plan" no longer select a project.
+2. **Unrelated memories leaked into substantive questions.** The importance fallback fired whenever
+   a search matched nothing, so a Kubernetes question imported a "prefers Rust" fact. It now fires
+   only when the message has no content terms at all — which is the "hi" case it was written for.
+3. **A retrieved fact could not answer.** With `memory: {retrieved: 1}` the turn still returned 502,
+   because no composer read the memory table. There is now a memory-anchored answer: quoted value,
+   key, date, store, `kind:'memory'` citation, and an explicit "this is your stored fact, not
+   portfolio data". The quoted value joins the evidence the verifier reads, so a number that really
+   is in evidence stops being reported as unsupported. One shared word is not a match.
+4. **An unresolvable follow-up was answered anyway.** "Tell me more about that one." went to the
+   provider with evidence retrieved for a different question and came back `verified:true` with four
+   citations: grounded, cited, and about the wrong subject. A follow-up that points at nothing
+   resolvable now asks which one, naming the candidates from the recent answers.
+5. **"It" searched a blended window instead of the last answer.** "What technologies does it use?"
+   saw five candidates, called it ambiguous, and returned the site-wide skill graph. It now reads
+   the immediately preceding answer first and widens only when that named nothing — so the question
+   is answered with *"RAG Knowledge Assistant declares: Python, LangChain / LlamaIndex, Vector
+   Databases, RAG, FastAPI"*, naming which of the two lists it read.
+6. **Two positions in one sentence bound only one.** "Compare the first and third projects" is not a
+   request for one project. Both resolve or neither does (out-of-range → abstain, with the
+   candidates still named in the refusal); "the 3rd" and words past "eighth" now parse.
+7. **A design question about this portfolio was refused offline.** No record describes unbuilt work,
+   so the composer returned nothing and the turn 502'd. It now routes agentic: retrieve the records
+   that constrain the answer, compose deterministically, `degraded=genai`, and `verified=true` —
+   which is what §12 asks for when no model is configured.
+8. **The verification disclaimer was stapled to greetings**, complete with an internal check id in
+   the sentence shown to a visitor: "hi" → "…This answers come straight from the portfolio data… I
+   could not fully verify that (grounded-mode-has-evidence)…". It requires claims on the table now
+   (runs, citations, or evidence), the ids stay in the trace, and the withholding is recorded.
+9. **Two contract gaps in the agent record.** Tools declared no determinism (now a required field,
+   enforced at registration — a tool that writes or reads mutable state says `false`), and step
+   records had no ids to link them to the persisted runs they summarise.
+10. **Health could not answer two questions the brief asks of it.** No `breaker.state`/`cooldown`
+    view, and nothing about whether a local model exists on the machine. There is now a top-level
+    breaker block and `detectLocalProvider`, which reports `reachable:false / "nothing is listening
+    on http://127.0.0.1:11434/v1 (network)"` here and — deliberately — never routes because of it.
+    The agentic trace also lacked a `synthesis` phase, so a synthesis turn and a deterministic one
+    looked identical until you diffed the citations.
+11. **Short client ids were silently replaced.** The conversation-id floor was 6 characters, so
+    `p13` meant a new conversation every turn; the session header had the same shape of rule, so a
+    short one minted a new session and a stored memory looked lost. Both floors are 3, and
+    `x-raven-session-source` / `x-raven-conversation-source` say which identity the turn was filed
+    under — because a replaced id is not an error, it is amnesia with a 200 on it.
+
+Also in this pass: the provider test double moved from `/tmp/genai-stub.mjs` (deleted by a sandbox
+reset mid-session) to **`scripts/local-provider-stub.mjs`**, with its switches documented in the
+file and §11.2, and a check that every variable in `.env.example` is read somewhere — the same class
+of bug as the two timeout budgets that were documented, believed, and ignored.
+
 ---
 
 ## 2. Layer map
@@ -320,7 +379,18 @@ text, no tokens.
 just ask?" and lets the provider see prior turns. Persisted whether or not a model is
 configured.
 
-**Long term** — durable facts per `sessionId`, `key → value` with an importance score.
+**Long term** — durable facts per `sessionId`, `key → value` with an importance score. Selection
+is by relevance to the question's terms (`searchMemories`), and the most-important fallback runs
+**only when the question has no content terms at all** — a greeting still gets who you told it you
+are, while a Kubernetes question gets nothing, rather than whatever was scored 0.9. An unmatched
+search means unmatched.
+
+A memory can also *answer*: when retrieval found nothing grounded and a stored row matches the
+question on at least two of its terms (or one, if the question is one word long), the turn replies
+with the quote, its key, its date, the store it came from, a `kind:'memory'` citation, and the
+sentence saying this is the user's own stored fact rather than portfolio data. The quoted value is
+added to the evidence the verifier reads, so a number that genuinely is in evidence is not reported
+as unsupported. Nothing crosses sessions, and an unmatched question is still refused.
 
 Extraction is a policy, not a transcript (`memory/extract.ts`):
 
@@ -593,7 +663,9 @@ and no database (trimmed):
 ```
 
 Headers: `x-raven-mode`, `x-raven-state`, `x-raven-latency-ms`, `x-raven-breaker`,
-`retry-after`, and `set-cookie` only when a session was minted.
+`x-raven-session-source` and `x-raven-conversation-source` (which identity the turn was filed under,
+so a replaced id is visible instead of feeling like memory loss), `retry-after`, and `set-cookie`
+only when a session was minted.
 `GET /api/raven` documents the accepted body; `GET /api/health` reports measured
 capabilities (`probe=0` skips the provider probe), including the tool table and the
 driver it fell back to. No streaming endpoint exists — replies are single JSON bodies.
@@ -632,14 +704,22 @@ Three rules, each asserted in `check-backend.mjs`:
 ### 11.2 Proving the provider path with no provider
 
 `mode:'genai'` is not something to take on faith, and it does not need a paid endpoint to be
-tested. A ~30-line OpenAI-compatible server on `127.0.0.1` that answers `/v1/models` and
-`/v1/chat/completions` — and can be told to return 401, 500, or nothing at all by the text
-of the prompt it receives — is enough to drive the real code path:
+tested. The repository ships the double it needs: **`scripts/local-provider-stub.mjs`**, a
+~100-line OpenAI-compatible server on `127.0.0.1:3199` that answers `/v1/models` and
+`/v1/chat/completions` and switches behaviour on what the request contains — `Authorization`
+containing `BADKEY` for 401 on every route, `FAIL THE MODEL` for 500, `RATE LIMIT ME` for 429
+with `Retry-After`, `MAKE IT HANG` for no answer at all, `GIBBERISH INSTEAD` for a body that is not
+JSON. It logs what it received (bytes, and whether the caller's stored preference arrived), which is
+how the memory-grounding claim is checked rather than asserted.
+
+It used to live in `/tmp`, which is why this section is now written against a committed file: a
+sandbox reset deleted the script mid-session, and a test path that evaporates is not a test path.
+It is plumbing with two canned sentences and no weights — nothing here describes it as a model.
 
 ```bash
-node /tmp/genai-stub.mjs &                       # a stub that speaks the wire format
+node scripts/local-provider-stub.mjs &           # plumbing, not a model
 RAVEN_BASE_URL=http://127.0.0.1:3199/v1 RAVEN_API_KEY=local-test-key \
-  RAVEN_MODEL=stub-1 RAVEN_MAX_RETRIES=0 npm run dev
+  RAVEN_MODEL=stub-1 npm run dev
 ```
 
 Measured against it, on a running server:
@@ -664,12 +744,12 @@ No model, no database, no network needed:
 
 ```bash
 npm run check            # typecheck + schema drift + assets + speech + face + brain + backend
-npm run check:brain      # 91 checks: states, intents, retrieval, tools, memory, drivers
+npm run check:brain      # 100 checks: states, intents, retrieval, tools, memory, drivers
                          #   (including the SQLite one and its schema-parity proof), honesty,
                          #   degradation, canonical response contract, deterministic voice
                          #   selection, concurrency, referent resolution, and the intent shapes
                          #   the browser types
-npm run check:backend    # 35 checks: Gemini + OpenAI-compatible transports against a real
+npm run check:backend    # 40 checks: Gemini + OpenAI-compatible transports against a real
                          #   local HTTP server, Supabase REST over real HTTP, both routes,
                          #   the one-line-per-turn log, and a rejection's field set
 npm run typecheck

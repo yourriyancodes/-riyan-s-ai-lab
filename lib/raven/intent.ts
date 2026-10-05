@@ -170,9 +170,19 @@ function extractProjectReference(text: string): string | null {
   const lower = normalize(text)
   const named = projects.find((project) => lower.includes(normalize(project.name)))
   if (named) return named.name
-  const numbered = lower.match(/\b(?:project\s*)?(0?[1-5])\b/)
-  if (numbered) {
-    const match = findProject(numbered[1])
+  // A digit inside a sentence is not a project reference until something says it is. Measured:
+  // "Remember that my canary release window is Thursday 02:00" was answered with the card for
+  // project 02, because normalization flattens "02:00" into "02 00" and a bare `(0?[1-5])` scan
+  // found it. Same class of mistake the section anchor below documents: a substring test on
+  // ordinary English is not a reference.
+  // `normalize` deletes punctuation, so the `#3` form has to be read from the raw text — and it is
+  // the one anchor that carries no word to lean on, which is exactly why it is allowed on its own.
+  const withoutClocks = lower.replace(/\b\d{1,2}[.:]\d{2}\b/g, ' ')
+  const hashRef = /(?:^|\s)#(0?[1-5])(?:\b|\s*[,.!?])/.exec(text.toLowerCase())?.[1]
+  const anchored = /(?:project|card|entry|number)\s*(0?[1-5])\b|\b(0?[1-5])\s*(?:project|card|number)/.exec(withoutClocks)
+  const digits = hashRef ?? anchored?.[1] ?? anchored?.[2]
+  if (digits) {
+    const match = findProject(digits)
     if (match) return match.name
   }
   return null
@@ -226,9 +236,12 @@ function extractSection(text: string): SectionReference | null {
  * ------------------------------------------------------------------ */
 
 export type RecentTurn = { role: string; content: string }
-export type ResolvedReferent = { name: string; how: 'term' | 'ordinal' | 'overlap'; note: string }
+export type ResolvedReferent = { name: string; how: 'term' | 'ordinal' | 'overlap' | 'single-candidate'; note: string }
 
-const ORDINAL_INDEX: Record<string, number> = { first: 0, second: 1, third: 2, fourth: 3, fifth: 4, sixth: 5, seventh: 6, eighth: 7 }
+const ORDINAL_INDEX: Record<string, number> = { first: 0, second: 1, third: 2, fourth: 3, fifth: 4, sixth: 5, seventh: 6, eighth: 7, ninth: 8, tenth: 9, eleventh: 10, twelfth: 11 }
+
+/** A position expressed as a number ("the 3rd one") is the same request as a word. */
+const ordinalIndex = (word: string): number | null => (word === 'last' ? null : /^\d+$/.test(word) ? Number.parseInt(word, 10) - 1 : ORDINAL_INDEX[word] ?? null)
 const REFERENTIAL = /\b(which one|which ones|which of them|which of those|the (?:first|second|third|fourth|fifth|last|latter|former)(?: one)?|that one|this one|those (?:two|three)?|it|its|they|them)\b/
 /** How far back a follow-up may reach. Bounded, like everything else here. */
 const LOOKBACK = 3
@@ -248,33 +261,54 @@ function mentions(text: string): { name: string; at: number }[] {
     .sort((a, b) => a.at - b.at)
 }
 
-export function resolveProjectReferent(text: string, recent: readonly RecentTurn[]): ResolvedReferent | null {
+export type ReferentDecision = {
+  /** The message points at something (`it`, "that one", an ordinal) and is short enough to be a follow-up. */
+  followUpShaped: boolean
+  resolved: ResolvedReferent | null
+  /** What the recent answers offered, in the order they were said. A clarification reads from this. */
+  candidates: string[]
+  /** More than one ordinal was used ("compare the first and third"): every name after the first. */
+  alsoResolved: string[]
+  /** Why an abstention happened, so the refusal can say something better than "unknown". */
+  reason?: 'nothing-listed' | 'out-of-range-ordinal' | 'tie'
+}
+
+const ORDINAL_ALL = /\b(?:the )?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|(\d+)(?:st|nd|rd|th)|last)\b/g
+
+export function judgeReferent(text: string, recent: readonly RecentTurn[]): ReferentDecision {
+  const noFollowUp: ReferentDecision = { followUpShaped: false, resolved: null, candidates: [], alsoResolved: [] }
   const clean = normalize(text)
-  if (!clean) return null
+  if (!clean) return noFollowUp
   const words = clean.split(' ')
   // A message with a subject of its own is not a follow-up, however many "it"s it contains.
-  if (words.length > 14 || !REFERENTIAL.test(clean)) return null
+  if (words.length > 14 || !REFERENTIAL.test(clean)) return noFollowUp
+  const decision: ReferentDecision = { followUpShaped: true, resolved: null, candidates: [], alsoResolved: [] }
   // The window is counted in things RAVEN *said*, not in table rows: an intervening question and
   // its one-line acknowledgement would otherwise spend two of three slots and put the listing the
   // user is pointing at out of reach (measured across a restart: "And what about the first one?"
   // resolved to the previous answer's single project instead of the listing two turns earlier).
-  // `recent` arrives oldest-first from every adapter, so the tail of the array is the recent part.
-  const said = recent.filter((turn) => turn.role === 'raven' && turn.content).reverse() // newest first
-  if (!said.length) return null
-  const ordinal = /\bthe (first|second|third|fourth|fifth|sixth|seventh|eighth)\b|\bthe last\b/.exec(clean)
+  // `recent` arrives oldest-first from every adapter, so reversing it puts the newest answer first.
+  const said = recent.filter((turn) => turn.role === 'raven' && turn.content).reverse()
+  if (!said.length) return { ...decision, reason: 'nothing-listed' }
+  const ordinals = [...clean.matchAll(ORDINAL_ALL)].map((match) => match[1]!)
   // An ordinal can only point at a *list*, so for those the search is for the most recent answer
   // that actually listed two or more projects — up to ORDINAL_LOOKBACK answers back, and no
   // further. If nothing in that reach was a list, the phrase has no referent here and the turn is
   // abstained on rather than matched to whatever project happens to be in the corpus first.
-  const listing = ordinal
+  const listing = ordinals.length
     ? said
         .slice(0, ORDINAL_LOOKBACK)
         .map((turn) => ({ turn, named: mentions(turn.content).length }))
         .find((entry) => entry.named >= 2)
     : null
-  const priorSource = ordinal ? (listing?.turn.content ?? '') : said.slice(0, LOOKBACK).map((turn) => turn.content).join(' ')
+  let priorSource = ordinals.length ? (listing?.turn.content ?? '') : (said[0]?.content ?? '')
+  // "it" refers to what was said last. Only when that answer named no project at all does the
+  // window widen — otherwise every follow-up would inherit subjects from three answers back and
+  // "what technologies does it use?" after a one-project answer would see five candidates and
+  // shrug, instead of reading the sentence it is actually answering.
+  if (!ordinals.length && priorSource && !mentions(priorSource).length) priorSource = said.slice(0, LOOKBACK).map((turn) => turn.content).join(' ')
   const prior = normalize(priorSource)
-  if (!prior) return null
+  if (!prior) return { ...decision, reason: 'nothing-listed' }
 
   // Only projects that answer actually named are candidates, ordered by where it said them and not
   // by corpus order: "the first one" means first *in the answer RAVEN just gave*, and taking the
@@ -286,24 +320,38 @@ export function resolveProjectReferent(text: string, recent: readonly RecentTurn
     .filter((entry) => entry.at >= 0)
     .sort((a, b) => a.at - b.at)
     .map((entry) => entry.project)
-  if (!mentioned.length) return null
+  decision.candidates = mentioned.map((project) => project.name)
+  if (!mentioned.length) return { ...decision, reason: 'nothing-listed' }
 
-  // Positional reference, resolved against the listing it pointed at.
-  if (ordinal?.[1]) {
-    const chosen = mentioned[ORDINAL_INDEX[ordinal[1]]]
-    if (chosen)
-      return {
-        name: chosen.name,
-        how: 'ordinal',
-        note: `“${clean}” resolved to “${chosen.name}” (position ${ORDINAL_INDEX[ordinal[1]] + 1} of that ${mentioned.length}-item list)`,
-      }
-    // Named fewer items than the ordinal asks for: "the fourth one" after a list of two is not a
-    // question about this corpus, and guessing the third project would be a fabrication.
-    return null
+  // Positional reference, resolved against the listing it pointed at. Two or three ordinals at
+  // once is a comparison request, so all of them resolve or none do — answering "compare the first
+  // and third" with one project is not a partial result, it is a different question.
+  if (ordinals.length) {
+    const picked = ordinals.map((word) => {
+      if (word === 'last') return mentioned[mentioned.length - 1]
+      const index = ordinalIndex(word)
+      return index === null || index < 0 ? undefined : mentioned[index]
+    })
+    if (picked.some((project) => !project)) return { ...decision, reason: 'out-of-range-ordinal' }
+    const [first, ...rest] = picked as { name: string }[]
+    decision.alsoResolved = rest.map((project) => project.name)
+    decision.resolved = {
+      name: first!.name,
+      how: 'ordinal',
+      note:
+        ordinals.length > 1
+          ? `“${clean}” resolved ${ordinals.length} positions of that ${mentioned.length}-item list: ${picked.map((project) => `“${project!.name}”`).join(', ')}`
+          : `“${clean}” resolved to “${first!.name}” (position ${(ordinals[0] === 'last' ? mentioned.length - 1 : (ordinalIndex(ordinals[0]!) ?? 0)) + 1} of that ${mentioned.length}-item list)`,
+    }
+    return decision
   }
-  if (/\bthe last\b/.test(clean)) {
-    const chosen = mentioned[mentioned.length - 1]!
-    return { name: chosen.name, how: 'ordinal', note: `“${clean}” resolved to the last project in that answer (“${chosen.name}”)` }
+
+  // One thing was named recently, and the message has no subject of its own. There is nothing to
+  // disambiguate, so this is a resolution rather than a guess.
+  if (mentioned.length === 1) {
+    const only = mentioned[0]!
+    decision.resolved = { name: only.name, how: 'single-candidate', note: `“${clean}” is about “${only.name}”, the only project the last answers mentioned` }
+    return decision
   }
 
   const terms = tokenize(text)
@@ -311,18 +359,30 @@ export function resolveProjectReferent(text: string, recent: readonly RecentTurn
   const named = mentioned.find((project) =>
     terms.some((term) => asKey(project.name).includes(term) || asKey(project.technology ?? '').includes(term) || asKey(project.description ?? '').includes(term)),
   )
-  if (named) return { name: named.name, how: 'term', note: `“${clean}” resolved to “${named.name}” by the words in the question` }
+  if (named) {
+    decision.resolved = { name: named.name, how: 'term', note: `“${clean}” resolved to “${named.name}” by the words in the question` }
+    return decision
+  }
 
-  // Last resort: score the candidates by overlap with the question, and only accept a single
-  // clear winner. Two candidates on the same score is a coin flip, and a coin flip is not a
-  // resolution — better to leave the turn as an honest `unknown`.
+  // Last resort: score the candidates by overlap with the question, and only accept a single clear
+  // winner. Two candidates on the same score is a coin flip, and a coin flip is not a resolution —
+  // better to ask which one, with the choices named.
   const scored = mentioned
     .map((project) => ({ project, hits: terms.filter((term) => asKey(`${project.name} ${project.description ?? ''} ${project.technology ?? ''}`).includes(term)).length }))
     .sort((a, b) => b.hits - a.hits)
   if (scored[0] && scored[0].hits > 0 && (scored[1]?.hits ?? 0) < scored[0].hits) {
-    return { name: scored[0].project.name, how: 'overlap', note: `“${clean}” resolved to “${scored[0].project.name}” as the only candidate the question’s words matched` }
+    decision.resolved = {
+      name: scored[0].project.name,
+      how: 'overlap',
+      note: `“${clean}” resolved to “${scored[0].project.name}” as the only candidate the question’s words matched`,
+    }
+    return decision
   }
-  return null
+  return { ...decision, reason: 'tie' }
+}
+
+export function resolveProjectReferent(text: string, recent: readonly RecentTurn[]): ResolvedReferent | null {
+  return judgeReferent(text, recent).resolved
 }
 
 /**
@@ -347,6 +407,14 @@ const HYPOTHETICAL_REQUEST =
   /\b(my next|next project|new project|project idea|architecture for|ideas for (?:a|my|the)|what should i build|suggest a|suggest some|recommend a|help me (?:build|plan|design))\b/i
 
 const PORTFOLIO_SHAPED_INTENTS: RavenIntent[] = ['portfolio.projects', 'portfolio.project', 'portfolio.skills', 'portfolio.experiments', 'portfolio.sections']
+
+/**
+ * Whether the asker is talking about *this* body of work rather than an imaginary one. It decides
+ * what an unanswered design question should do: "adding authentication to Riyan's portfolio" has
+ * records to stand on, "my next project" has none. Deliberately narrow — a possessive "my project"
+ * is exactly the phrasing that must NOT be answered from someone else's repository.
+ */
+const ABOUT_THIS_PORTFOLIO = /\b(riyan|riyan's|his portfolio|the portfolio|this portfolio|this site|this repo|this repository|this codebase)\b/i
 
 export function classifyIntent(message: string, options: ClassifyOptions = {}): IntentMatch {
   const text = message.replace(/\s+/g, ' ').trim()
@@ -415,6 +483,10 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
     for (const intent of PORTFOLIO_SHAPED_INTENTS) if (scores.delete(intent)) suppressed.push(`${reason}:${intent}`)
   }
   const suppressionReasons = [...new Set(suppressed.map((entry) => entry.slice(0, entry.indexOf(':'))))]
+  // Recorded here, where the words are in front of the code, because the router only sees an
+  // `IntentMatch` and must not have to re-read the message to decide what an unanswered turn can
+  // still be answered *from*.
+  const aboutThisPortfolio = ABOUT_THIS_PORTFOLIO.test(lower) ? 1 : undefined
 
   // Nothing matched. `smalltalk` is a claim about the *words*, not about their count: the
   // previous test here was `contentTokens <= 2`, which silently turned every short question
@@ -442,7 +514,7 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
       entities: {
         ...(contentTokens ? { tokens: contentTokens } : {}),
         ...(section ? { section: section.id } : {}),
-        ...(suppressionReasons.length ? { unanswerableByCorpus: suppressionReasons.join('+') } : {}),
+        ...(suppressionReasons.length ? { unanswerableByCorpus: suppressionReasons.join('+'), ...(aboutThisPortfolio ? { aboutThisPortfolio } : {}) } : {}),
       },
     }
   }
@@ -464,6 +536,6 @@ export function classifyIntent(message: string, options: ClassifyOptions = {}): 
     intent,
     confidence: Number(confidence.toFixed(3)),
     signals: [...winning.signals, ...(suppressed.length ? [`suppress:${suppressed.join(',')}`] : [])],
-    entities: suppressed.length ? { ...entities, unanswerableByCorpus: suppressionReasons.join('+') } : entities,
+    entities: suppressed.length ? { ...entities, unanswerableByCorpus: suppressionReasons.join('+'), ...(aboutThisPortfolio ? { aboutThisPortfolio } : {}) } : entities,
   }
 }

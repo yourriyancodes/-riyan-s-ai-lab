@@ -140,6 +140,10 @@ export class ToolRegistry {
 
   register(spec: ToolSpec, handler: ToolHandler): this {
     if (this.tools.has(spec.name)) throw new Error(`tool "${spec.name}" is already registered`)
+    // Enforced at registration rather than in a test only, because a tool added by a caller that
+    // never went through `TOOL_SPECS` would otherwise be silently unlabelled — and the agent's
+    // choice to reuse one answer per turn depends on the label being there.
+    if (typeof spec.deterministic !== 'boolean') throw new Error(`tool "${spec.name}" must declare deterministic`)
     this.tools.set(spec.name, {
       spec,
       handler,

@@ -27,6 +27,10 @@ export type RavenConfig = {
     /** Only used by `openai` (local servers accept 0..2); clamped before use. */
     temperature: number
     maxOutputTokens: number
+    /** Address health checks for an unconfigured local model (see `detectLocalProvider`). */
+    localProbeUrl: string
+    /** Short by design: detection is a courtesy, not a reason to delay a status page. */
+    localProbeTimeoutMs: number
   }
   limits: {
     /** Matches the input cap the console and the previous route already honoured. */
@@ -131,6 +135,12 @@ export function ravenConfig(): RavenConfig {
       baseUrl:
         baseUrl ??
         (id === 'openai' ? 'http://127.0.0.1:11434/v1' : 'https://generativelanguage.googleapis.com'),
+      // Where to look for a zero-cost local endpoint that nobody configured. `RAVEN_PROVIDER=openai`
+      // already defaults to Ollama's URL above; this is the *detection* address health reports on, so
+      // the answer to "is there a model on this machine?" is measured on every deployment shape, not
+      // only on the one that opted in.
+      localProbeUrl: env('RAVEN_LOCAL_PROBE_URL') ?? 'http://127.0.0.1:11434/v1',
+      localProbeTimeoutMs: Math.min(2000, int('RAVEN_TIMEOUT_MS', 25_000)),
       timeoutMs: int('RAVEN_TIMEOUT_MS', 25_000),
       maxRetries: Math.min(3, int('RAVEN_MAX_RETRIES', 2)),
       temperature: Math.max(0, Math.min(2, Number(env('RAVEN_TEMPERATURE') ?? 0.35))),
@@ -234,6 +244,9 @@ export function describeCapabilities(config = ravenConfig()): RavenCapabilities 
       'RAVEN_DB_DRIVER',
       'RAVEN_ALLOW_FILE_STORE',
       'RAVEN_AGENT_MAX_STEPS',
+      'RAVEN_AGENT_STEP_TIMEOUT_MS',
+      'RAVEN_AGENT_TURN_TIMEOUT_MS',
+      'RAVEN_LOCAL_PROBE_URL',
       'RAVEN_CONTEXT_CHAR_BUDGET',
       'SESSION_SECRET',
       'VOICE_PROVIDER_KEY',

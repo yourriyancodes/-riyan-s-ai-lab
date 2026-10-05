@@ -86,6 +86,24 @@ export function routeTurn({ intent, capabilities, allowedModes }: RouteInput): R
     return decision
   }
 
+  // §12: a design question aimed at *this* portfolio has records to stand on, so it goes through
+  // the agent — retrieve the projects, skills and constraints that exist, then compose over them
+  // (with a provider when one is authorized, without one deterministically and `degraded`).
+  // Refusing it because no document describes work that has not been done is technically honest and
+  // practically useless; the honest version of this answer names the records it is standing on.
+  // A design question about a project that does not exist yet keeps its refusal: there is nothing
+  // here to retrieve, and `aboutThisPortfolio` is the flag that says so.
+  if (
+    intent.intent === 'unknown' &&
+    intent.entities?.unanswerableByCorpus === 'hypothetical' &&
+    intent.entities?.aboutThisPortfolio === 1 &&
+    capabilities.knowledgeAvailable
+  ) {
+    const decision = decide('agentic', { usedTools: true, usedProvider: canUseProvider, usedKnowledge: true })
+    decision.reasons.push('a design question about these records is planned against them, not answered from imagination')
+    return decision
+  }
+
   if (EXPLAIN_INTENTS.has(intent.intent)) {
     if (canUseProvider) return decide('genai', { usedKnowledge: true })
     // Without a model, an explanation is only honest if the corpus defines the term; the

@@ -47,6 +47,10 @@ export function planRetrieval(input: { intent: IntentMatch; message: string }): 
       break
     case 'portfolio.skills':
       push({ tool: 'get_skills', input: {} }, 'skills are read from the focus list and the skill-graph nodes')
+      // A resolved project means the question is about *that* project's stack, and the portfolio
+      // documents per-project stacks separately from the skills section. Without this the answer
+      // would be the site-wide graph — true, and not what was asked.
+      if (projectRef) push({ tool: 'get_project', input: { ref: projectRef } }, `“it” resolved to a project, so its own documented stack is consulted too: "${projectRef}"`)
       break
     case 'portfolio.contact':
       push({ tool: 'get_contact', input: {} }, 'only links that exist in the data are returned')
