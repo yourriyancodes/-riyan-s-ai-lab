@@ -1,10 +1,40 @@
 import { Analytics } from '@vercel/analytics/next'
-import { Cormorant_Garamond, Geist, Geist_Mono } from 'next/font/google'
+import localFont from 'next/font/local'
 import type { Metadata, Viewport } from 'next'
 
-const geist = Geist({ subsets: ['latin'], variable: '--font-geist' })
-const geistMono = Geist_Mono({ subsets: ['latin'], variable: '--font-geist-mono' })
-const cormorant = Cormorant_Garamond({ subsets: ['latin'], variable: '--font-cormorant' })
+// Self-hosted fonts (SIL Open Font License 1.1, see app/fonts/*-OFL.txt).
+// Local files keep `next build` offline and remove third-party font requests.
+const geist = localFont({
+  src: './fonts/geist-latin.woff2',
+  weight: '100 900',
+  style: 'normal',
+  variable: '--font-geist',
+  display: 'swap',
+  fallback: ['system-ui', 'sans-serif'],
+})
+
+const geistMono = localFont({
+  src: './fonts/geist-mono-latin.woff2',
+  weight: '100 900',
+  style: 'normal',
+  variable: '--font-geist-mono',
+  display: 'swap',
+  fallback: ['ui-monospace', 'monospace'],
+  adjustFontFallback: false,
+})
+
+const cormorant = localFont({
+  src: [
+    { path: './fonts/cormorant-garamond-latin-400-normal.woff2', weight: '400', style: 'normal' },
+    { path: './fonts/cormorant-garamond-latin-400-italic.woff2', weight: '400', style: 'italic' },
+    { path: './fonts/cormorant-garamond-latin-700-normal.woff2', weight: '700', style: 'normal' },
+    { path: './fonts/cormorant-garamond-latin-700-italic.woff2', weight: '700', style: 'italic' },
+  ],
+  variable: '--font-cormorant',
+  display: 'swap',
+  fallback: ['Georgia', 'Times New Roman', 'serif'],
+  adjustFontFallback: 'Times New Roman',
+})
 import './globals.css'
 
 export const metadata: Metadata = {
