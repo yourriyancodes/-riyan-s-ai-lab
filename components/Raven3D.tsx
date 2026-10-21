@@ -377,7 +377,6 @@ export default function Raven3D({ depth, state, speaking, blinking }: Raven3DPro
       scleraMaterial.dispose()
       irisMaterial.dispose()
       pupilMaterial.dispose()
-      hairMaterial.dispose()
       headGeo.dispose()
       neckGeo.dispose()
       bustGeo.dispose()

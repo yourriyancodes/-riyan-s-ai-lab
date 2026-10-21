@@ -7,6 +7,10 @@
 ========================================================= */
 
 :root {
+  /* The interface is a dark cinematic environment. Declaring the scheme here
+     keeps native controls and scrollbars dark even when the OS prefers light. */
+  color-scheme: dark;
+
   /* Cinematic Dark Environment (Primary) */
   --background: #05070a;
   --surface: #080b10;

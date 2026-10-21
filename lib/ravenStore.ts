@@ -56,7 +56,8 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
       id: 'welcome-1',
       sender: 'raven',
       text: "Greetings. I am RAVEN — Riyan Pasha's Autonomous Virtual Engineering Nexus. How may I assist your exploration today?",
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      // Filled in after mount so the server and first client render agree.
+      timestamp: '',
     },
   ],
   isListening: false,

@@ -29,5 +29,10 @@
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    // Legacy Vite entry points, not part of the active Next.js App Router build.
+    "src",
+    "vite.config.ts"
+  ]
 }

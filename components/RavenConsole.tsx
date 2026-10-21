@@ -16,6 +16,8 @@ import { useRavenStore } from '@/lib/ravenStore'
 
 export default function RavenConsole() {
   const [inputText, setInputText] = useState('')
+  // Client-only clock label for the seeded greeting, which has no server timestamp.
+  const [sessionTime, setSessionTime] = useState('')
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
 
   const {
@@ -34,6 +36,10 @@ export default function RavenConsole() {
   useEffect(() => {
     checkBackendHealth()
   }, [checkBackendHealth])
+
+  useEffect(() => {
+    setSessionTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
+  }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -179,7 +185,9 @@ export default function RavenConsole() {
                   <User size={13} /> YOU
                 </span>
               )}
-              <span className="text-[10px] text-gray-500 mono">{msg.timestamp}</span>
+              {(msg.timestamp || sessionTime) && (
+                <span className="text-[10px] text-gray-500 mono">{msg.timestamp || sessionTime}</span>
+              )}
             </div>
 
             <div
