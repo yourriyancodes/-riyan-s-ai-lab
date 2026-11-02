@@ -1,12 +1,26 @@
 import { NextResponse } from 'next/server'
+import { runRaven } from '@/lib/raven/pipeline'
+import { resolveProviderConfig } from '@/lib/raven/provider'
+import { parseRavenRequest } from '@/lib/raven/types'
 
 export const runtime = 'nodejs'
 
-const STATES = [
-  'IDLE', 'LISTENING', 'UNDERSTANDING', 'RESEARCHING', 'REASONING',
-  'PLANNING', 'WAITING', 'EXECUTING', 'VERIFYING', 'SPEAKING',
-  'SUCCESS', 'WARNING', 'ERROR', 'OFFLINE',
-] as const
+function statusFor(response: { state: string }): number {
+  switch (response.state) {
+    case 'SUCCESS':
+      return 200
+    case 'WAITING':
+      return 429
+    case 'OFFLINE':
+      return 503
+    case 'WARNING':
+      return 200
+    default:
+      // Provider failure or a rejected answer: the upstream call did not produce
+      // a usable, verified response.
+      return 502
+  }
+}
 
 export async function POST(request: Request) {
   let body: unknown
@@ -20,48 +34,34 @@ export async function POST(request: Request) {
     )
   }
 
-  const input =
-    typeof body === 'object' &&
-    body !== null &&
-    'input' in body &&
-    typeof body.input === 'string'
-      ? body.input.trim()
-      : ''
-
-  if (!input) {
+  const parsed = parseRavenRequest(body)
+  if (!parsed.ok) {
     return NextResponse.json(
-      { state: 'ERROR', code: 'INPUT_REQUIRED', message: 'RAVEN needs an input.' },
-      { status: 400 },
+      { state: 'ERROR', code: parsed.code, message: parsed.message },
+      { status: parsed.status },
     )
   }
 
-  if (input.length > 4000) {
-    return NextResponse.json(
-      { state: 'ERROR', code: 'INPUT_TOO_LONG', message: 'Input is limited to 4000 characters.' },
-      { status: 413 },
-    )
-  }
+  // Credentials stay on the server: only this route resolves them.
+  const resolution = resolveProviderConfig()
 
-  const providerConfigured = Boolean(process.env.RAVEN_API_KEY && process.env.RAVEN_MODEL)
-
-  if (!providerConfigured) {
+  if (!resolution.configured) {
     return NextResponse.json(
       {
         state: 'OFFLINE',
-        code: 'RAVEN_OFFLINE',
-        message: 'RAVEN is not connected to an AI provider yet.',
-        availableStates: STATES,
+        code: resolution.reason === 'UNSUPPORTED_PROVIDER' ? 'PROVIDER_UNSUPPORTED' : 'RAVEN_OFFLINE',
+        message:
+          resolution.reason === 'UNSUPPORTED_PROVIDER'
+            ? `Provider "${resolution.providerId}" is not supported by this build. Use "gemini".`
+            : 'RAVEN is not connected to an AI provider yet. Set RAVEN_API_KEY (or GEMINI_API_KEY) and RAVEN_MODEL on the server.',
       },
       { status: 503 },
     )
   }
 
-  return NextResponse.json(
-    {
-      state: 'WARNING',
-      code: 'PROVIDER_ADAPTER_NOT_IMPLEMENTED',
-      message: 'The provider is configured, but its adapter still needs to be connected.',
-    },
-    { status: 501 },
-  )
+  const response = await runRaven(parsed.input, parsed.history, {
+    provider: resolution.provider,
+  })
+
+  return NextResponse.json(response, { status: statusFor(response) })
 }

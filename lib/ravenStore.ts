@@ -1,5 +1,17 @@
 import { create } from 'zustand'
 import { siteConfig } from '@/data/siteConfig'
+import { askRaven, getRavenHealth } from '@/lib/ravenClient'
+import type { RavenTurn } from '@/lib/raven/types'
+
+/** Short-term memory window sent with each request. */
+const MEMORY_TURNS = 8
+
+function toHistory(messages: ChatMessage[]): RavenTurn[] {
+  return messages
+    .filter((m) => m.sender === 'user' || m.sender === 'raven')
+    .slice(-MEMORY_TURNS)
+    .map((m) => ({ role: m.sender === 'user' ? 'user' : 'raven', text: m.text }))
+}
 
 export type RavenState =
   | 'IDLE'
@@ -88,36 +100,25 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
 
   checkBackendHealth: async () => {
     set({ isCheckingHealth: true })
-    try {
-      const res = await fetch('/api/health')
-      if (res.ok) {
-        const data = await res.json()
-        if (data.status === 'ok' && data.apiKeyConfigured) {
-          set({
-            isOnline: true,
-            healthMessage: 'RAVEN LLM Backend Online',
-            isCheckingHealth: false,
-          })
-          return
-        }
-      }
-      set({
-        isOnline: false,
-        healthMessage: 'Offline Mode: Local Knowledge Engine Active',
-        isCheckingHealth: false,
-      })
-    } catch {
-      set({
-        isOnline: false,
-        healthMessage: 'Offline Mode: Local Knowledge Engine Active',
-        isCheckingHealth: false,
-      })
-    }
+    const health = await getRavenHealth()
+    const configured = Boolean(health?.providerConfigured ?? health?.apiKeyConfigured)
+    const model = health?.provider?.model
+
+    set({
+      isOnline: configured,
+      healthMessage: configured
+        ? `RAVEN online${model ? ` — ${model}` : ''}`
+        : 'Offline Mode: Local Knowledge Engine Active',
+      isCheckingHealth: false,
+    })
   },
 
   sendMessage: async (text: string) => {
     if (!text.trim()) return
     const { addMessage, setState, isOnline, isVoiceOutputEnabled } = get()
+
+    // Snapshot short-term memory before this turn is appended.
+    const history = toHistory(get().messages)
 
     // Add user message
     addMessage({ sender: 'user', text })
@@ -128,18 +129,19 @@ export const useRavenStore = create<RavenStoreState>((set, get) => ({
       let toolUsed: string | undefined
 
       if (isOnline) {
-        // Query server endpoint
-        const res = await fetch('/api/raven', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text }),
-        })
-        if (res.ok) {
-          const data = await res.json()
-          replyText = data.reply || data.message
-          toolUsed = data.toolUsed
+        // Genuine provider call through the server; the key never reaches the browser.
+        const response = await askRaven(text, history)
+
+        if (response.state === 'SUCCESS') {
+          replyText = response.output
+          toolUsed = response.toolUsed
         } else {
-          throw new Error('API server error')
+          // Provider unavailable or answer rejected: fall back to the local
+          // knowledge engine, and say why instead of inventing a reply.
+          const { processLocalQuery } = await import('@/lib/agentTools')
+          const result = await processLocalQuery(text)
+          replyText = result.reply
+          toolUsed = `${result.toolUsed} (local fallback: ${response.code})`
         }
       } else {
         // Fallback to local intelligent agent response tool

@@ -1,36 +1,69 @@
-export type RavenState =
-  | 'IDLE' | 'LISTENING' | 'UNDERSTANDING' | 'RESEARCHING' | 'REASONING'
-  | 'PLANNING' | 'WAITING' | 'EXECUTING' | 'VERIFYING' | 'SPEAKING'
-  | 'SUCCESS' | 'WARNING' | 'ERROR' | 'OFFLINE'
+import type { RavenResponse, RavenTurn } from './raven/types'
 
-export type RavenResponse = {
-  state: RavenState
-  output?: string
-  code?: string
-  message?: string
+export type {
+  RavenResponse,
+  RavenState,
+  RavenTurn,
+  RavenSuccess,
+  RavenFailure,
+  RavenSource,
+  RavenUsage,
+} from './raven/types'
+
+export type RavenHealth = {
+  status: string
+  providerConfigured: boolean
+  /** Present for older deployments that only exposed this flag. */
+  apiKeyConfigured?: boolean
+  provider?: {
+    id: string
+    model: string
+    configured: boolean
+    keySource?: string
+    reason?: string
+  }
+  providerCatalog?: {
+    id: string
+    defaultModel: string
+    freeTierModels: readonly string[]
+  }
+  ownerAuthConfigured?: boolean
+  voiceConfigured?: boolean
+  databaseConfigured?: boolean
 }
 
-export async function askRaven(input: string): Promise<RavenResponse> {
+/**
+ * Browser client for the RAVEN endpoint.
+ *
+ * Sends the canonical `{ input, history }` body the API expects and returns the
+ * typed response. Never references a credential — the key lives on the server.
+ */
+export async function askRaven(input: string, history: RavenTurn[] = []): Promise<RavenResponse> {
   const response = await fetch('/api/raven', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({ input, history }),
   })
 
-  const data = (await response.json().catch(() => ({}))) as RavenResponse
+  const data = (await response.json().catch(() => null)) as RavenResponse | null
 
-  if (!response.ok) {
+  if (!data || typeof data !== 'object' || !('state' in data)) {
     return {
-      state: data.state ?? 'ERROR',
-      code: data.code ?? 'REQUEST_FAILED',
-      message: data.message ?? 'RAVEN could not process the request.',
+      state: 'ERROR',
+      code: 'INVALID_RESPONSE',
+      message: 'RAVEN returned an unreadable response.',
     }
   }
 
   return data
 }
 
-export async function getRavenHealth() {
-  const response = await fetch('/api/health', { cache: 'no-store' })
-  return response.json()
+export async function getRavenHealth(): Promise<RavenHealth | null> {
+  try {
+    const response = await fetch('/api/health', { cache: 'no-store' })
+    if (!response.ok) return null
+    return (await response.json()) as RavenHealth
+  } catch {
+    return null
+  }
 }

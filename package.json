@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --import ./lib/raven/__tests__/register.mjs --test lib/raven/__tests__/*.test.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
