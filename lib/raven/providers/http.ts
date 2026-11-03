@@ -10,7 +10,7 @@
 
 export type HttpFailure = {
   ok: false
-  code: 'rate_limited' | 'timeout' | 'network' | 'bad_response' | 'unavailable' | 'auth'
+  code: 'rate_limited' | 'timeout' | 'network' | 'bad_response' | 'unavailable' | 'auth' | 'aborted'
   message: string
   status?: number
   retryAfterMs?: number
@@ -34,6 +34,12 @@ export type HttpRequest = {
   /** Attempts beyond the first. Backoff is exponential, `Retry-After` wins when present. */
   retries?: number
   retryBaseMs?: number
+  /**
+   * The caller's own deadline. Without it, a turn that has already given up leaves the retry loop
+   * running against the provider — which costs a request that nobody will read, on a free tier whose
+   * budget is the product. When it fires mid-flight the request stops and reports `aborted`.
+   */
+  signal?: AbortSignal
   /** Overridable so tests never actually sleep. */
   sleep?: (ms: number) => Promise<void>
 }
@@ -57,9 +63,33 @@ export async function requestJson(request: HttpRequest): Promise<HttpSuccess | H
   const attempts = Math.max(1, 1 + (request.retries ?? 0))
   let last: HttpFailure | null = null
 
+  // A backoff is where a caller who has given up should end the exchange, so the wait is raced
+  // against the signal instead of slept through. Returns true when it was cut short.
+  const waitBeforeRetry = async (ms: number): Promise<boolean> => {
+    if (!request.signal) {
+      await sleep(ms)
+      return false
+    }
+    if (request.signal.aborted) return true
+    return Promise.race([
+      sleep(ms).then(() => false),
+      new Promise<boolean>((resolve) => request.signal!.addEventListener('abort', () => resolve(true), { once: true })),
+    ])
+  }
+
+  const aborted = (): HttpFailure | null =>
+    request.signal?.aborted
+      ? { ok: false, code: 'aborted', message: 'Abandoned: this turn stopped waiting for the provider, so the request was cancelled instead of paying for an answer nobody will read.', ms: Date.now() - started }
+      : null
+
   for (let attempt = 0; attempt < attempts; attempt++) {
+    // Checked before every attempt, so a deadline that fired while the previous one was in flight
+    // stops the loop rather than starting another request.
+    const stopped = aborted()
+    if (stopped) return stopped
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error('timeout')), request.timeoutMs)
+    request.signal?.addEventListener('abort', () => controller.abort(new Error('aborted')), { once: true })
     let response: Response | null = null
     let raw = ''
     try {
@@ -71,10 +101,9 @@ export async function requestJson(request: HttpRequest): Promise<HttpSuccess | H
       })
       raw = await response.text().catch(() => '')
     } catch (error) {
-      const aborted = (error as Error)?.name === 'AbortError' || controller.signal.aborted
-      last = aborted
+      last = aborted() ?? ((error as Error)?.name === 'AbortError' || controller.signal.aborted
         ? { ok: false, code: 'timeout', message: `No response within ${request.timeoutMs} ms.`, ms: Date.now() - started }
-        : { ok: false, code: 'network', message: `Transport failure: ${(error as Error)?.message ?? 'unknown'}`, ms: Date.now() - started }
+        : { ok: false, code: 'network', message: `Transport failure: ${(error as Error)?.message ?? 'unknown'}`, ms: Date.now() - started })
     } finally {
       clearTimeout(timer)
     }
@@ -92,7 +121,7 @@ export async function requestJson(request: HttpRequest): Promise<HttpSuccess | H
           ms: Date.now() - started,
         }
         if (RETRYABLE.has(response.status) && attempt + 1 < attempts) {
-          await sleep(retryAfterMs ?? (request.retryBaseMs ?? 500) * 2 ** attempt)
+          if (await waitBeforeRetry(retryAfterMs ?? (request.retryBaseMs ?? 500) * 2 ** attempt)) return aborted() ?? { ok: false, code: 'aborted', message: 'Aborted while backing off.', ms: Date.now() - started }
           continue
         }
         return last
@@ -117,7 +146,7 @@ export async function requestJson(request: HttpRequest): Promise<HttpSuccess | H
     // usually transient, and worth one more attempt.
     if (last?.code === 'timeout') return last
     if (attempt + 1 < attempts) {
-      await sleep((request.retryBaseMs ?? 400) * 2 ** attempt)
+      if (await waitBeforeRetry((request.retryBaseMs ?? 400) * 2 ** attempt)) return aborted() ?? { ok: false, code: 'aborted', message: 'Aborted while backing off.', ms: Date.now() - started }
       continue
     }
   }

@@ -326,7 +326,7 @@ export type ProviderResult =
       ok: false
       provider: string
       /** Stable code the UI and tests switch on. */
-      code: 'no_provider' | 'rate_limited' | 'timeout' | 'network' | 'bad_response' | 'unavailable' | 'refused' | 'too_long'
+      code: 'no_provider' | 'rate_limited' | 'timeout' | 'network' | 'bad_response' | 'unavailable' | 'refused' | 'too_long' | 'aborted'
       message: string
       retryAfterMs?: number
       ms: number
@@ -384,7 +384,16 @@ export type RavenMetadata = {
   toolsUsed: string[]
   toolRuns: ToolRun[]
   agentRunId: string | null
-  provider: { id: string; label: string; model: string; context?: { chars: number; kept: number; dropped: number; dedupedChars: number } } | null
+  provider: {
+    id: string
+    label: string
+    model: string
+    context?: { chars: number; kept: number; dropped: number; dedupedChars: number }
+    /** The model's own round trip in ms — the number to compare against the turn's `latencyMs`. */
+    ms?: number
+    /** What the call cost. `inputChars`/`outputChars` are always known; token counts only when the endpoint reports `usage`. */
+    usage?: { inputChars: number; outputChars: number; inputTokens?: number; outputTokens?: number }
+  } | null
   memory: { driver: string; retrieved: number; stored: number }
   database: { driver: string; configured: boolean; reachable: boolean; detail: string }
   latencyMs: number

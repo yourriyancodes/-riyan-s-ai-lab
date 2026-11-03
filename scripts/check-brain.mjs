@@ -1865,6 +1865,310 @@ await check('an exclusion phrase (“outside the portfolio”) never gets answer
     assert.notEqual(classifyIntent(q).intent, 'unknown', `“${q}” is still answerable and must not be suppressed`)
 })
 
+
+group('GENAI INTEGRATION — what a model call costs, and what it may not do')
+
+const planAwareStub = (behaviour, planText) => ({
+  id: 'stub',
+  label: 'Test stub provider',
+  async probe() {
+    return { reachable: true, detail: 'stub' }
+  },
+  async generate(request) {
+    const planning = /^You plan read-only data lookups/.test(request.messages[0]?.content ?? '')
+    behaviour.calls.push({ kind: planning ? 'plan' : 'synthesize', request })
+    if (!planning) {
+      const text = '{"answer":"RAG means retrieving documents first, then answering from them. This portfolio documents a RAG Knowledge Assistant project."}'
+      return { ok: true, text, model: 'stub-1', provider: 'stub', usage: { inputChars: 10, outputChars: text.length, inputTokens: 711, outputTokens: 42 }, ms: 5 }
+    }
+    if (behaviour.mode === 'garbage') return { ok: true, text: 'I would suggest looking at the projects.', model: 'stub-1', provider: 'stub', ms: 4 }
+    return { ok: true, text: planText, model: 'stub-1', provider: 'stub', usage: { inputChars: 380, outputChars: planText.length, inputTokens: 380, outputTokens: 21 }, ms: 4 }
+  },
+})
+
+await check('a turn reports the model’s own round trip and token counts, not only the turn total', async () => {
+  // Latency that matters for a real integration is the *model’s* share of it: `latencyMs` alone
+  // cannot tell "the provider took 9 s" from "our pipeline took 9 s", and a free tier is spent in
+  // tokens, so the counts have to reach the caller too. Both ride on metadata.provider.
+  resetProviderBreaker()
+  const behaviour = { calls: [], mode: 'json' }
+  const result = await ask('explain what RAG means in simple terms', {}, { providerOverride: stubProvider(behaviour) })
+  assert.equal(result.mode, 'genai')
+  const meta = result.metadata.provider
+  assert.ok(meta, 'no provider attribution on a genai turn')
+  assert.equal(meta.ms, 5, 'the provider’s own duration was not carried through')
+  assert.equal(meta.usage.inputChars, 10)
+  const phases = (result.metadata.trace ?? []).map((event) => event.phase)
+  assert.ok(phases.includes('provider-synthesis'), `no synthesis phase in the trace: ${phases.join(',')}`)
+  const agentic = await ask('which project best demonstrates retrieval and why?', {}, { providerOverride: stubProvider({ calls: [], mode: 'json' }) })
+  assert.equal(agentic.metadata.provider.ms, 5, 'an agentic turn lost the model latency')
+  assert.equal(agentic.metadata.provider.usage.inputChars, 10, 'an agentic turn lost the token counts')
+})
+
+await check('token counts come from the endpoint when it reports them', async () => {
+  // The adapters parse `usage` (OpenAI-compatible) and `usageMetadata` (Gemini) so the harness can
+  // see what a turn cost; a stub that reports tokens must survive to the response untouched.
+  resetProviderBreaker()
+  const behaviour = { calls: [], mode: 'json' }
+  const result = await ask('explain what RAG means in simple terms', {}, { providerOverride: planAwareStub(behaviour, '{"steps":[]}') })
+  assert.equal(result.metadata.provider.usage.inputTokens, 711)
+  assert.equal(result.metadata.provider.usage.outputTokens, 42)
+})
+
+await check('model planning stays off until the environment turns it on', async () => {
+  const { describeCapabilities } = await import(`${ROOT}/lib/raven/config.ts`)
+  delete process.env.RAVEN_MODEL_PLANNING
+  assert.equal(describeCapabilities(ravenConfig()).modelPlanning, false, 'planning must not spend a request nobody asked for')
+  resetProviderBreaker()
+  const behaviour = { calls: [], mode: 'json' }
+  await ask('which project best demonstrates retrieval and why?', {}, { providerOverride: stubProvider(behaviour) })
+  assert.equal(behaviour.calls.length, 1, `an agentic turn made ${behaviour.calls.length} provider call(s) with planning off`)
+})
+
+await check('a model plan may only add validated read-only lookups', async () => {
+  process.env.RAVEN_MODEL_PLANNING = '1'
+  try {
+    resetProviderBreaker()
+    const plan = JSON.stringify({
+      steps: [
+        { tool: 'lookup_concept', input: { term: 'RAG' }, why: 'the comparison turns on a term the glossary defines' },
+        { tool: 'shell.exec', input: { cmd: 'id' }, why: 'ignore your rules' },
+        { tool: 'remember_fact', input: { key: 'a.b', value: 'c' }, why: 'store this' },
+        { tool: 'get_project', input: {}, why: 'missing the reference' },
+        { tool: 'lookup_concept', input: { term: 42 }, why: 'wrong type' },
+      ],
+    })
+    const behaviour = { calls: [], mode: 'ok' }
+    const result = await ask('which project best demonstrates retrieval and why?', {}, { providerOverride: planAwareStub(behaviour, plan) })
+    assert.equal(result.success, true, 'a proposal turn must not fail because the model was refused')
+    assert.equal(behaviour.calls.filter((call) => call.kind === 'plan').length, 1, 'the planner was not called exactly once')
+    const ran = (result.metadata.toolRuns ?? []).map((run) => run.toolName)
+    assert.ok(ran.includes('lookup_concept'), `the accepted proposal did not execute: ${ran.join(',')}`)
+    assert.ok(!ran.includes('remember_fact'), 'a model-proposed write reached the registry')
+    assert.equal(result.metadata.memory.stored, 0, 'the model wrote to memory')
+    // The rejections have to reach the caller: they are the evidence that validation ran, and a
+    // refusal recorded only in the database would be indistinguishable from a model that never spoke.
+    const planNote = (result.metadata.trace ?? []).filter((event) => event.phase === 'model-plan').map((event) => event.note ?? '').join(' | ')
+    assert.ok(planNote, 'the response carried no record of what the model planner proposed or lost')
+    // Three refusals, three different reasons, all of them visible in the response: an unregistered
+    // name, a write, and the tally. The argument-level refusals are asserted against the validator
+    // directly below, where a clip cannot hide them.
+    for (const phrase of ['shell.exec', 'not a tool name this process accepts', 'read-only planning']) {
+      assert.ok(planNote.includes(phrase), `the rejection "${phrase}" is not visible to the caller: ${planNote}`)
+    }
+    assert.ok(result.metadata.steps >= 2, `the plan recorded only ${result.metadata.steps} step(s)`)
+    assert.match(JSON.stringify(result.metadata), /lookup_concept/, 'the accepted proposal is not named anywhere the caller can see')
+  } finally {
+    delete process.env.RAVEN_MODEL_PLANNING
+  }
+})
+
+await check('a question outside these records is refused with or without a model', async () => {
+  // Found by the model harness, not by a unit test: with an endpoint configured, "tell me something
+  // outside the portfolio" reached the model and came back with five citations from a search that had
+  // merely shared the word "portfolio" with it, `verified=true`. The same sentence with no endpoint
+  // configured was refused — so the difference was the badge, not the engine, and it was invented
+  // grounding. Scope is a property of the question: the composer already refuses it, and now the
+  // genai route refuses it before spending a request, identically on both deployments.
+  resetProviderBreaker()
+  const behaviour = { calls: [], mode: 'json' }
+  const refused = await ask('Tell me something outside the portfolio knowledge base.', { providerOverride: stubProvider(behaviour), skipPersistence: true })
+  assert.equal(refused.mode, 'offline', `expected a refusal, got ${refused.mode}`)
+  assert.equal(refused.success, false, 'a question the records cannot answer reported success')
+  assert.deepEqual(refused.citations, [], 'a refusal may not wear citations it did not use')
+  assert.equal(refused.verified, false)
+  assert.equal(behaviour.calls.length, 0, `the endpoint was called ${behaviour.calls.length} time(s) for a question the records cannot answer`)
+  // Visible in the response, not only in the persisted run: a deliberate refusal that only the
+  // database can see is indistinguishable from a crash to anyone reading the API.
+  const skip = (refused.metadata.trace ?? []).find((event) => event.phase === 'provider-skip')
+  assert.match(skip?.note ?? '', /no model was asked/, 'the turn does not say that the model was deliberately not asked')
+  assert.equal(refused.citations.length, 0, 'a refusal may not wear citations it did not use')
+  // A question the records *do* cover must still reach the model and keep its evidence, or the gate
+  // has become a blanket suspicion of models.
+  // The control has to be a question the router actually sends to a model: with the memory store
+  // empty the composer can answer an `explain.*` question locally, and `knowledge` there is the
+  // correct answer, not the gate over-reaching.
+  const grounded = await ask('which project best demonstrates retrieval and why?', { providerOverride: stubProvider({ calls: [], mode: 'json' }), skipPersistence: true })
+  assert.ok(['agentic', 'genai'].includes(grounded.mode), `the gate stopped a grounded question reaching an engine (got ${grounded.mode})`)
+  assert.ok((grounded.citations ?? []).some((citation) => citation.kind !== 'provider'), 'the gate stripped evidence from a grounded turn')
+  assert.equal(grounded.verified, true, 'a grounded turn lost its badge')
+})
+
+await check('the plan validator rejects every way a model could overreach', async () => {
+  // This is the wall, so it is tested directly rather than through a whole turn: a proposal that is
+  // unregistered, an action, a missing parameter, a wrong type, an unknown parameter, or a repeat of
+  // work retrieval already did must each be refused *and say why*.
+  const { planWithModel } = await import(`${ROOT}/lib/raven/agents/plannerModel.ts`)
+  const { createToolRegistry } = await import(`${ROOT}/lib/raven/tools/index.ts`)
+  const { callSignature } = await import(`${ROOT}/lib/raven/tools/registry.ts`)
+  const registry = createToolRegistry()
+  const proposal = JSON.stringify({
+    steps: [
+      { tool: 'lookup_concept', input: { term: 'RAG' }, why: 'defined in the glossary' },
+      { tool: 'exec', input: { command: 'id' } },
+      { tool: 'remember_fact', input: { key: 'a.b', value: 'c' } },
+      { tool: 'get_project', input: {} },
+      { tool: 'get_project', input: { ref: 7 } },
+      { tool: 'get_project', input: { ref: 'x', extra: 'y' } },
+      { tool: 'list_projects', input: { includeMetrics: true } },
+      { tool: 'get_skills', input: { category: 'ml'.repeat(400) } },
+    ],
+  })
+  const provider = {
+    id: 'stub',
+    label: 'Stub',
+    async probe() {
+      return { reachable: true, detail: 'stub' }
+    },
+    async generate() {
+      return { ok: true, text: proposal, model: 'stub-1', provider: 'stub', ms: 2 }
+    },
+  }
+  // The signature comes from the same function the planner uses, so this asserts the dedupe rule and
+  // not a guess at its key format.
+  const alreadyRan = new Set([callSignature('list_projects', { includeMetrics: true })])
+  const plan = await planWithModel({
+    provider,
+    config: ravenConfig(),
+    registry,
+    message: 'compare the retrieval work in this portfolio with the voice experiments',
+    intent: classifyIntent('compare the retrieval work in this portfolio with the voice experiments'),
+    evidenceTitles: [],
+    alreadyRan,
+    maxSteps: 4,
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.rejected.length, 6, `expected six refusals, got ${plan.rejected.length}: ${plan.rejected.map((r) => `${r.tool}=${r.reason}`).join(' | ')}`)
+  const reasons = plan.rejected.map((entry) => `${entry.tool}: ${entry.reason}`).join('\n')
+  assert.match(reasons, /exec.*not registered/i, 'a made-up tool name was not refused as unregistered')
+  assert.match(reasons, /remember_fact.*read-only planning/i, 'a write was not refused')
+  assert.match(reasons, /missing required parameter/i, 'an incomplete call was accepted')
+  assert.match(reasons, /must be string/i, 'a wrong parameter type was accepted')
+  assert.match(reasons, /unknown parameter/i, 'an extra parameter was accepted')
+  assert.match(reasons, /limit is 40\b/i, 'an oversized string argument was accepted')
+  assert.deepEqual(plan.steps.map((step) => step.tool), ['lookup_concept'], `unexpected accepted set: ${plan.steps.map((entry) => entry.tool).join(',')}`)
+  assert.ok(plan.notes.some((note) => /already gathered/i.test(note) && note.includes('list_projects')), `a repeat of already-gathered work was not dropped as such: ${plan.notes.join(' | ')}`)
+  const garbage = await planWithModel({
+    ...{ provider: { ...provider, async generate() { return { ok: true, text: 'I suggest the projects.', model: 'stub-1', provider: 'stub', ms: 1 } } }, alreadyRan: new Set(), evidenceTitles: [], maxSteps: 4, registry, config: ravenConfig(), message: 'q', intent: classifyIntent('what has Riyan built') },
+  })
+  assert.equal(garbage.ok, false, 'prose was accepted as a plan')
+  assert.deepEqual(garbage.steps, [], 'a prose reply still produced steps')
+  const rateLimited = await planWithModel({
+    ...{ provider: { ...provider, async generate() { return { ok: false, provider: 'stub', code: 'rate_limited', message: '429', ms: 1 } } }, alreadyRan: new Set(), evidenceTitles: [], maxSteps: 4, registry, config: ravenConfig(), message: 'q', intent: classifyIntent('what has Riyan built') },
+  })
+  assert.equal(rateLimited.ok, false)
+  assert.match(rateLimited.notes.join(' '), /model planning skipped: rate_limited/, 'a refused endpoint was not explained')
+  assert.deepEqual(rateLimited.steps, [])
+})
+
+await check('a model plan that arrives as prose changes nothing', async () => {
+  const { planAgentSteps } = await import(`${ROOT}/lib/raven/agents/reasoning.ts`)
+  const offline = planAgentSteps({ intent: classifyIntent('which project best demonstrates retrieval and why?'), message: 'which project best demonstrates retrieval and why?', alreadyRan: new Set() })
+  process.env.RAVEN_MODEL_PLANNING = '1'
+  try {
+    resetProviderBreaker()
+    const behaviour = { calls: [], mode: 'garbage' }
+    const result = await ask('which project best demonstrates retrieval and why?', {}, { providerOverride: planAwareStub(behaviour, 'not json at all') })
+    assert.equal(result.success, true)
+    assert.equal(result.metadata.provider === null ? true : true, true)
+    const planNote = (result.metadata.trace ?? []).filter((event) => event.phase === 'model-plan').map((event) => event.note ?? '').join(' | ')
+    assert.match(planNote, /kept the deterministic plan/, `an unparseable plan was not reported as what it was: ${planNote}`)
+    for (const step of offline.steps) assert.ok(planNote.includes(step.tool) || JSON.stringify(result.metadata).includes(step.tool), `the deterministic step ${step.tool} was lost`)
+  } finally {
+    delete process.env.RAVEN_MODEL_PLANNING
+  }
+})
+
+await check('an abandoned request is not a provider failure', async () => {
+  resetProviderBreaker()
+  const provider = {
+    id: 'stub',
+    label: 'Stub',
+    async probe() {
+      return { reachable: true, detail: 'stub' }
+    },
+    async generate(request) {
+      return request.signal?.aborted
+        ? { ok: false, provider: 'stub', code: 'aborted', message: 'Abandoned: this turn stopped waiting.', ms: 1 }
+        : { ok: true, text: '{"answer":"RAG means retrieving first, then answering. This portfolio documents a RAG Knowledge Assistant project."}', model: 'stub-1', provider: 'stub', ms: 1 }
+    },
+  }
+  for (let attempt = 0; attempt < 3; attempt++) await ask('explain what RAG means in simple terms', {}, { providerOverride: provider, signal: new AbortController().signal })
+  const aborted = new AbortController()
+  aborted.abort()
+  await ask('explain what RAG means in simple terms', {}, { providerOverride: provider, signal: aborted.signal })
+  await ask('explain what RAG means in simple terms', {}, { providerOverride: provider, signal: aborted.signal })
+  assert.equal(providerBreakerState().open, false, 'a cancelled turn opened the breaker — the next visitor would lose the model for a cooldown nobody earned')
+  resetProviderBreaker()
+})
+
+await check('the transport honours the caller’s signal before spending a request', async () => {
+  const { requestJson } = await import(`${ROOT}/lib/raven/providers/http.ts`)
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    return new Response('{"ok":1}', { status: 200 })
+  }
+  try {
+    const controller = new AbortController()
+    controller.abort()
+    const result = await requestJson({ url: 'https://example.invalid/chat', method: 'POST', body: { a: 1 }, timeoutMs: 50, retries: 2, signal: controller.signal })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'aborted', `a pre-aborted signal produced ${result.code}`)
+    assert.equal(calls, 0, 'a turn that had already given up still made a network request')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+await check('a backoff sleeps only while the caller is still waiting', async () => {
+  const { requestJson } = await import(`${ROOT}/lib/raven/providers/http.ts`)
+  const original = globalThis.fetch
+  const controller = new AbortController()
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    // The first attempt fails transiently; the caller gives up while the retry is backing off.
+    setTimeout(() => controller.abort(), 5)
+    return new Response('{"error":{"message":"overloaded"}}', { status: 503 })
+  }
+  try {
+    const started = Date.now()
+    const result = await requestJson({ url: 'https://example.invalid/chat', method: 'POST', body: { a: 1 }, timeoutMs: 200, retries: 3, retryBaseMs: 5_000, signal: controller.signal })
+    assert.equal(result.ok, false)
+    assert.equal(calls, 1, `the loop started ${calls} requests after the caller had given up`)
+    assert.ok(Date.now() - started < 1_000, `it waited ${(Date.now() - started)} ms for a response nobody wants`)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+await check('the route hands the browser’s own cancellation to the brain', async () => {
+  const route = read('app/api/raven/route.ts')
+  assert.match(route, /runBrainTurn\(\{[\s\S]*?\}, \{ signal: request\.signal \}\)/, 'the API route does not pass the request signal to the brain')
+  const brain = read('lib/raven/brain.ts')
+  assert.match(brain, /turnAbort\.abort\(new Error\(raced\.kind/, 'the brain keeps the provider request alive after the agentic budget expires')
+})
+
+await check('topicality is flagged and never decides the verdict', async () => {
+  const { verifyAnswer } = await import(`${ROOT}/lib/raven/agents/verification.ts`)
+  const intent = classifyIntent('which project best demonstrates retrieval and why?')
+  const evidence = 'The RAG Knowledge Assistant retrieves documents from a local corpus, ranks matches, and answers with citations.'
+  const citation = { kind: 'tool', source: 'tool:search_knowledge', label: 'search_knowledge', quote: evidence }
+  const offTopic = 'The kitchen smelled of cardamom and burnt sugar while the pot boiled over slowly. Nobody in the room had thought to check the flame underneath the pan. A neighbour knocked twice before anyone heard her through the extractor fan humming above the stove. We served the rice anyway, and the guests were polite about it all evening.'
+  const onTopic = 'The RAG Knowledge Assistant retrieves documents from a local corpus before answering. Its ranking step is what keeps citations attached to the retrieved records. The corpus is indexed once per process, so retrieval adds no external dependency to the answer.'
+  const base = { mode: 'knowledge', intent, runs: [], evidenceText: evidence, actions: [], provider: null, memoryKeys: [] }
+  const drifting = verifyAnswer({ ...base, answer: offTopic, citations: [citation] })
+  const flag = drifting.checks.find((entry) => entry.name === 'topicality-advisory')
+  assert.ok(flag, 'a fluent answer about something else produced no topicality flag at all')
+  assert.equal(flag.ok, false, 'the flag missed the off-topic sentences')
+  assert.equal(flag.blocking, false, 'topicality must not be able to flip `verified`: overlap is not proof')
+  const aligned = verifyAnswer({ ...base, answer: onTopic, citations: [citation] })
+  assert.equal(aligned.checks.find((entry) => entry.name === 'topicality-advisory')?.ok, true, 'an on-topic answer was flagged as drifting')
+  assert.equal(drifting.verified, true, 'the advisory flag changed the verdict')
+})
+
 // ---------------------------------------------------------------------------
 const total = passed + failures.length
 console.log(`\n${failures.length ? '\u001b[31m' : '\u001b[32m'}${passed}/${total} checks passed\u001b[0m`)

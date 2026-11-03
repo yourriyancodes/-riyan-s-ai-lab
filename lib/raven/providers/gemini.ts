@@ -113,7 +113,11 @@ export function createGeminiProvider(options: GeminiOptions): ModelProvider {
         headers,
         body,
         timeoutMs: options.timeoutMs,
-        retries: request.signal ? 0 : (options.maxRetries ?? 0),
+        // Retries used to be disabled whenever the caller supplied a signal, because a retry loop that
+        // outlived the turn cost requests nobody read. The transport now watches the signal itself, so
+        // retries are kept and cancellation is real rather than a workaround.
+        retries: options.maxRetries ?? 0,
+        ...(request.signal ? { signal: request.signal } : {}),
         sleep: options.sleep,
       })
 

@@ -386,3 +386,182 @@ clean, `next build` clean. Twelve checks were added this round; **none was weake
 the new behaviours were each proved non-vacuous by deleting the mechanism and watching the test fail
 (memory skip, sentence dedupe, relevance-ordered selection, signature dedupe, the evaluative routing
 rule).
+
+---
+
+# Phase 3 — real model integration
+
+Brief: audit the provider integration without rewriting it, find a genuinely
+zero-cost model, verify the hybrid workflow, and report what is real. The visual
+layer stayed frozen; the stub stayed a stub.
+
+## P3.0 What could actually be reached
+
+Measured, not assumed. From this sandbox:
+
+| endpoint | result |
+| --- | --- |
+| `api.github.com`, `registry.npmjs.org` | 200 |
+| `generativelanguage.googleapis.com`, `api.groq.com`, `api.openai.com`, `openrouter.ai`, `api.mistral.ai`, `models.github.ai`, `registry.ollama.ai`, `ollama.com`, `huggingface.co` | no route (connection failure, not a 4xx) |
+| local inference (`ollama`, `llama-server`, `vllm`) | binary absent; 2 vCPU / 3 GB RAM / 19 GB free |
+
+**No real model was contacted, and none could have been.** There is no credential in
+this environment and no route to any provider. Everything below that says "measured"
+was measured against the repository's own test double
+(`scripts/local-provider-stub.mjs`), which speaks the real wire format and produces no
+meaningful text. It is evidence about the plumbing, never about a model.
+
+## P3.1 Free-tier research — secondary sources only
+
+Vendor documentation was unreachable, so the figures below come from web search and
+are labelled accordingly. **Treat them as leads to verify, not as terms.**
+
+| service | what the research says |
+| --- | --- |
+| Groq `api.groq.com/openai/v1` | free plan, no card; ~30 RPM / 1 000 RPD / 8 000 TPM per model (`gpt-oss-120b`, `gpt-oss-20b`); limits are per organisation |
+| OpenRouter `openrouter.ai/api/v1` | `:free` model ids; ~20 RPM / 50 RPD (1 000 RPD after ≥$10 lifetime credit); free providers may log prompts |
+| Mistral La Plateforme | free/"Experiment" tier ≈1 B tokens/month, ≈1 req/s; requires phone verification and opt-in to training |
+| Google AI Studio | a free tier exists but Google no longer publishes per-model numbers; since 2026-04-01 Pro models are paid-only, Flash/Flash-Lite free; free-tier data may be used for training |
+| **GitHub Models** | **retired 2026-07-30** — playground, catalogue and inference API gone, endpoint returns 410. Tutorials citing `models.github.ai/inference` are obsolete |
+| Cerebras | free tier replaced 2026-07-16 by a $5, 30-day, card-required trial |
+
+Nothing was installed, subscribed to or paid for, and no key was requested. The
+integration is provider-shaped, so any of these is one `RAVEN_BASE_URL` away — but the
+claim stops at "the adapter speaks this format", which is what the test double proves.
+
+## P3.2 Defects found by auditing the integration
+
+Four real ones, each with a mechanism change and a test.
+
+**1. An out-of-scope question was answered as soon as a model existed.**
+The classifier's `outside-scope` verdict was enforced on the keyless path only. With a
+provider configured, the same sentence went to the model, came back fluent, collected
+five near-miss citations, and verification stamped it `verified: true` — because
+verification checks correspondence between answer and citations, not whether the
+question was in scope. Refusing keyless and answering with a model is exactly the
+"looks intelligent" failure the brief rules out. Fixed by running the scope gate
+before any provider call: the turn now reports `degraded.because = "not attempted: …"`
+and a `provider-skip` note. Asserted both ways (gate closes on the question; a normal
+question still reaches the provider).
+
+**2. A cancelled turn kept calling the model.**
+The HTTP route never passed its signal down, so a browser that navigated away left the
+request — and its retries — running to completion. Fixed: `request.signal` → a
+`turnAbort` controller → the transport; retry backoff is raced against the signal
+instead of slept through; `aborted` is a first-class provider code. The abort is also
+checked before each attempt, so a turn cancelled between retries makes no request at
+all (asserted by counting the stub's log).
+
+**3. Client cancellation was about to poison the breaker.**
+Once `aborted` existed it would have counted as a provider failure, so a user hitting
+refresh twice would open the circuit and degrade the next honest turn. The breaker now
+ignores `aborted` explicitly, asserted by failing a turn via cancellation and reading
+`failures: 0` back from `/api/health`.
+
+**4. Model latency and pipeline latency were one number.**
+`metadata.provider` reported characters only. A slow turn could not be attributed to
+the model or to the pipeline. It now carries `ms` and `usage` (chars always, tokens
+when the provider reports them), and the harness prints the two lines separately.
+
+## P3.3 Mechanisms added
+
+**Model-assisted planning, opt-in and walled.** `RAVEN_MODEL_PLANNING=1` lets the agent
+ask the model for next steps before its deterministic gap rules. Every proposal passes
+five server-side rules: registered name → `validateToolInput` against the tool's own
+spec → `permission !== 'action'` → `callSignature` dedupe → step ceiling. Dropped
+proposals are reported as the reason in `planNotes` and surfaced as a `model-plan`
+trace note. No model-generated code is executed; the model proposes names and
+arguments, the registry decides. Each rule is asserted with a hostile proposal.
+
+**Topicality advisory (non-blocking).** Emits when an answer shares no wording with the
+citations under it. It cannot block: lexical overlap proves neither relevance nor its
+absence. **Citation overlap is not evidence of topical correctness**, and no mechanism
+here proves a fluent answer is about the question — the flag exists so an operator can
+see the suspicion, not so the pipeline can claim certainty.
+
+**Breaker knobs.** `RAVEN_BREAKER_THRESHOLD` (default 2) and `RAVEN_BREAKER_COOLDOWN_MS`
+(default 60 000), both visible in `/api/health` along with `failures` while closed.
+
+## P3.4 Measured — against the test double
+
+`node scripts/measure.mjs model --port <port> --stub`, request counts read from the
+endpoint's own log.
+
+Authorized endpoint, default breaker:
+
+| case | result |
+| --- | --- |
+| A local question | 30 ms · mode `knowledge` · **0 provider calls** |
+| B remembered fact | 17 ms · `knowledge` · **0 calls** |
+| C synthesis | 47 ms · `genai` · 1 call · **model 19 ms of a 35 ms turn** · prompt 5 696 chars / 1 473 tok → answer 135 chars / 40 tok · 6 kept, 0 dropped |
+| D multi-record | 16 ms · `agentic` · 1 call · 4 tool runs · 6 citations |
+| E analysis | 15 ms · `agentic` · 1 call · 3 runs · 8 citations |
+| F out of scope | **502 · offline · 0 calls · 0 citations · `verified: false`** |
+| G planning off | 14 ms · `agentic` · 1 call |
+| breaker | `2 req [closed] 530 ms → 2 req [open] 517 ms → 0 req [open] 8 ms` |
+
+The same run with `RAVEN_BREAKER_THRESHOLD=8`, so the failure modes can be dialled
+without the breaker opening first:
+
+| failure mode | result |
+| --- | --- |
+| socket never answers | **4 018 ms** — gave up at the configured 4 000 ms timeout, answered locally · 1 request |
+| 429 + `Retry-After` | **1 023 ms** — backed off, answered from local evidence · 2 requests |
+| 500 upstream | **514 ms** — retried, then answered locally with the model uncredited · 2 requests |
+| 200 with a non-JSON body | **10 ms** — treated as a failure, not as an answer · 1 request |
+
+Refused credential (`RAVEN_API_KEY=BADKEY` against the double, which 401s that header):
+
+- `/api/health` reports `PARTIALLY_READY`, `probed.authorized: false`, and the note
+  *"The provider endpoint answered but rejected the credentials (401/403)"* — the
+  distinction between "no endpoint" and "endpoint refused us" is visible to an operator;
+- a refused turn costs **459 ms, 2 requests, mode `knowledge`, provider `unavailable`**
+  and never credits a model;
+- cases C and G report `UNMEASURED`, not failure — no synthesis is possible without a
+  usable credential, and calling that a failure would hide real ones.
+
+**What these numbers do not say.** They measure whether a model was called, what it
+cost, what it was given to stand on, and how the turn behaved when it failed. Two
+answers of the same length and different content produce identical rows. No row in any
+table above is evidence about answer quality, and none is evidence that a commercial
+provider was contacted.
+
+## P3.5 The boundary, stated plainly
+
+Phase 3 is **integration-ready, not integration-verified**.
+
+| area | status |
+| --- | --- |
+| Local knowledge, retrieval, memory, tools, verification | FUNCTIONAL, unchanged |
+| Provider wire formats, retry, timeout, breaker, cancellation, usage accounting | VERIFIED against the test double |
+| Planning validation wall | VERIFIED against hostile proposals |
+| Grounding gate, scope refusal, degradation | VERIFIED, including with a provider configured |
+| **Real model connectivity** | **NOT ESTABLISHED** — no credential, no route, no local inference |
+| **Real model answer quality** | **UNKNOWN** — nothing here can judge it |
+| Topical correctness | ADVISORY ONLY — citation overlap is not proof |
+
+To finish the round on a machine with egress: install nothing, set
+`RAVEN_PROVIDER=openai-compatible`, `RAVEN_BASE_URL=https://api.groq.com/openai/v1`,
+`RAVEN_MODEL=gpt-oss-20b`, `RAVEN_API_KEY=<free key>`, and re-run
+`node scripts/measure.mjs model --port <port>`. The cases will measure real latency and
+real token counts; the answer-quality questions in §13.5 of `RAVEN-BRAIN.md` will still
+need a human to read the answers.
+
+## Phase-3 status
+
+```
+LOCAL KNOWLEDGE   FUNCTIONAL
+DATABASE/MEMORY   FUNCTIONAL
+AGENTIC           FUNCTIONAL — registry-gated, planning wall added
+VERIFICATION      FUNCTIONAL — + non-blocking topicality advisory
+GENAI PLUMBING    VERIFIED against the test double only
+REAL MODEL        NOT CONTACTED — no credential, no route, no local inference
+ANSWER QUALITY    UNKNOWN — unmeasurable here, and not inferable from a green harness
+COST              ₹0 spent; no service installed or subscribed
+```
+
+Counts after this round: `npm run check` **468 green** (13 + 70 + 92 + 89 + 38 + 119 + 47),
+`tsc` clean, `next build` clean. Twelve checks were added this round; **none was
+weakened or removed**, and each new mechanism was proved non-vacuous by disabling it and
+watching the check fail (planning env gate, action-tool rejection, topicality advisory,
+abort before request, breaker skip on cancellation, out-of-scope gate).

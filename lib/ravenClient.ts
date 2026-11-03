@@ -71,7 +71,16 @@ export type RavenMetadata = {
   toolsUsed: string[]
   toolRuns: RavenToolRun[]
   agentRunId: string | null
-  provider: { id: string; label: string; model: string } | null
+  provider: {
+    id: string
+    label: string
+    model: string
+    /** Present only when the model answered: the call's own duration, separate from the turn's. */
+    ms?: number
+    /** What the call cost, in characters always and in tokens when the endpoint reported `usage`. */
+    usage?: { inputChars: number; outputChars: number; inputTokens?: number; outputTokens?: number }
+    context?: { chars: number; kept: number; dropped: number; dedupedChars: number }
+  } | null
   memory: { driver: string; retrieved: number; stored: number }
   database: { driver: string; configured: boolean; reachable: boolean; detail: string }
   latencyMs: number

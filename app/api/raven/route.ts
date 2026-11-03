@@ -137,7 +137,7 @@ export async function POST(request: Request): Promise<Response> {
     visionContext,
     approvedActions,
     ...(allowedModes?.length ? { allowedModes } : {}),
-  })
+  }, { signal: request.signal })
 
   const headers: Record<string, string> = {
     'x-raven-mode': result.mode,

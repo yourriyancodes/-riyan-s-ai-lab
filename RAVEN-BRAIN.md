@@ -890,7 +890,7 @@ No model, no database, no network needed:
 
 ```bash
 npm run check            # typecheck + schema drift + assets + speech + face + brain + backend
-npm run check:brain      # 107 checks: states, intents, retrieval, tools, memory, drivers
+npm run check:brain      # 119 checks: states, intents, retrieval, tools, memory, drivers
                          #   (including the SQLite one and its schema-parity proof), honesty,
                          #   degradation, canonical response contract, deterministic voice
                          #   selection, concurrency, referent resolution, and the intent shapes
@@ -907,6 +907,9 @@ node --experimental-strip-types --disable-warning=ExperimentalWarning \
      --import ./scripts/lib/tsr.mjs scripts/measure.mjs micro    # per-function floors
 node --experimental-strip-types --disable-warning=ExperimentalWarning \
      --import ./scripts/lib/tsr.mjs scripts/measure.mjs context  # what each prompt is made of
+
+# the provider harness needs a running server — see §13
+RAVEN_STUB_LOG=/tmp/stub.log node scripts/measure.mjs model --port 3102 --stub
 npm run schema           # regenerate db/schema.sql after editing schema.ts
 ```
 
@@ -924,7 +927,167 @@ is the whole test infrastructure — no Jest, no Vitest, nothing to install.
 
 ---
 
-## 13. Deliberately not implemented
+## 13. Real model integration (Phase 3)
+
+Everything above was built and verified keyless. This section is about what changes
+when a model is actually attached, what the server does about it, and — stated up
+front — **what has not been verified against a real provider**.
+
+### 13.1 The wire formats
+
+Two formats, both already in `lib/raven/providers/`:
+
+| provider | endpoint | auth | shape |
+| --- | --- | --- | --- |
+| `openai-compatible` | `POST {RAVEN_BASE_URL}/chat/completions` | `Authorization: Bearer $RAVEN_API_KEY` | `{ model, messages: [{ role, content }], temperature, max_tokens, response_format }` |
+| `gemini` | `POST {RAVEN_BASE_URL}/models/{model}:generateContent` | `x-goog-api-key` header | `{ systemInstruction, contents, generationConfig, tools }` |
+
+`RAVEN_BASE_URL` is the only thing that decides which service you talk to, so any
+OpenAI-compatible endpoint works without code changes:
+
+| service | `RAVEN_PROVIDER` | `RAVEN_BASE_URL` |
+| --- | --- | --- |
+| Groq | `openai-compatible` | `https://api.groq.com/openai/v1` |
+| OpenRouter | `openai-compatible` | `https://openrouter.ai/api/v1` |
+| Mistral | `openai-compatible` | `https://api.mistral.ai/v1` |
+| Google AI Studio | `gemini` | `https://generativelanguage.googleapis.com/v1beta` |
+| local Ollama | `openai-compatible` | `http://127.0.0.1:11434/v1` |
+| local llama.cpp / vLLM / LM Studio | `openai-compatible` | that server's `/v1` |
+
+Both adapters read token usage when the provider reports it (`usage` /
+`usageMetadata`) and never fail when it is absent.
+
+### 13.2 What Phase 3 changed, and why
+
+Six changes, all additive. The provider abstraction, the offline path, the
+retrieval pipeline and every existing test are unchanged in behaviour.
+
+**1. Cancellation.** The turn now carries an `AbortSignal` from the HTTP request to
+the transport. A client that navigates away stops the model request instead of
+leaving it running; retry backoff is raced against the signal rather than slept
+through; the transport has a pre-attempt abort check. `aborted` is a first-class
+provider code and **does not open the breaker** — a cancelled call is not evidence
+that the provider is failing, and counting it as such turned a browser refresh into
+a degraded turn.
+
+**2. Model latency is reported separately from pipeline latency.**
+`metadata.provider` now carries `ms` and `usage` alongside the existing chars, so a
+slow answer can be attributed to the model or to the pipeline instead of being one
+blurred number. The harness prints both lines.
+
+**3. Model-assisted planning — opt-in, and validated.** With `RAVEN_MODEL_PLANNING=1`
+the agent asks the model for the next steps before falling back to its deterministic
+gap rules. Every proposal is validated server-side against the tool registry:
+
+| rule | rejects |
+| --- | --- |
+| the name must be in `registry.specs()` | invented tools |
+| `validateToolInput` must pass | wrong or missing arguments |
+| `tool.permission !== 'action'` | anything that mutates state |
+| `callSignature` dedupe | a step the plan already contains |
+| step ceiling | an unbounded plan |
+
+Dropped proposals are kept as the reason in `planNotes` and surfaced as a
+`model-plan` trace note, so "the model suggested something unusable" is visible
+rather than silently ignored. The deterministic planner still runs and still fills
+whatever the model did not supply. **No model-generated code is executed, and no
+tool outside the registry can be reached** — the model proposes names and arguments,
+the server decides.
+
+**4. Out-of-scope questions never reach the model.** Previously a question the
+classifier marked `outside-scope` was refused keyless but *answered* the moment an
+endpoint was configured — the model would produce a fluent paragraph and retrieval
+would attach five near-miss citations, which verification then stamped `verified`.
+Now the same gate runs first, the turn reports `degraded.because = "not attempted: …"`
+and a `provider-skip` note, and no request is spent. A model does not change what
+this corpus can support.
+
+**5. Topicality advisory.** `verifyAnswer` emits a non-blocking `topicality-advisory`
+check when the answer's wording shares nothing with the citations it is standing on.
+It does not block, because lexical overlap is not proof of relevance either way — it
+is a signal for the operator. **Citation overlap is not evidence that an answer is
+about the question**; a fluent, well-cited, off-topic answer is the failure mode this
+flag exists to catch, and nothing in the pipeline currently proves topical
+correctness.
+
+**6. Breaker knobs.** `RAVEN_BREAKER_THRESHOLD` and `RAVEN_BREAKER_COOLDOWN_MS`
+(defaults 2 and 60 000) exist so an operator can measure failure modes without the
+breaker opening after two attempts. Both appear in `/api/health`, including
+`failures` while the breaker is closed, so a provider that is failing but not yet
+open is visible.
+
+### 13.3 New environment variables
+
+| variable | default | effect |
+| --- | --- | --- |
+| `RAVEN_MODEL_PLANNING` | unset | `1` lets the model propose validated plan steps |
+| `RAVEN_BREAKER_THRESHOLD` | `2` | provider failures before the breaker opens |
+| `RAVEN_BREAKER_COOLDOWN_MS` | `60000` | how long it stays open |
+
+### 13.4 Measuring a live provider
+
+```bash
+node scripts/local-provider-stub.mjs --port 3199      # test double, logs refusals too
+RAVEN_PROVIDER=openai-compatible RAVEN_BASE_URL=http://127.0.0.1:3199/v1 \
+RAVEN_MODEL=stub-1 RAVEN_API_KEY=dev-token RAVEN_STUB_LOG=/tmp/stub.log \
+  node_modules/.bin/next start -p 3102 &
+
+RAVEN_STUB_LOG=/tmp/stub.log node scripts/measure.mjs model --port 3102 --stub
+```
+
+The harness runs seven turns and a failure matrix:
+
+| case | what it asserts |
+| --- | --- |
+| A | a question the local index answers spends **zero** provider calls |
+| B | a fact stored earlier in the session answers the next question with zero calls |
+| C | synthesis names the provider and model, reports latency and tokens, and is grounded |
+| D | a multi-record question runs the tools instead of guessing |
+| E | an analysis request reaches the agent, not a listing |
+| F | an out-of-scope question is refused **with or without a model**, spending nothing |
+| G | model-assisted planning either proposes validated steps or says it could not |
+
+The failure matrix dials the endpoint into a hang, a 429 with `Retry-After`, a 500,
+a non-JSON body, a refused credential, and an open breaker, and reads request counts
+**from the endpoint's own log** — a refusal that the double did not log would
+otherwise read as "no request was made".
+
+Three properties of the harness matter more than any row in it:
+
+- `UNMEASURED` is neither a pass nor a failure. Two provider failures open the
+  breaker, so one run cannot measure the whole matrix; a row skipped for that reason
+  says so, with the instruction that would measure it.
+- Cases that need an authorized endpoint (C, G) are excluded from the failure tally
+  when the credential is refused, instead of being reported as failures.
+- The harness never judges answer quality. It records whether a model was called,
+  what it cost, what it was given to stand on, and how the turn behaved when it
+  failed. Two fluent answers about different subjects produce the same row.
+
+### 13.5 What this has not been verified against
+
+**No real provider has been contacted from this environment.** The sandbox has no
+model credential and no route to any model endpoint — `generativelanguage.googleapis.com`,
+`api.groq.com`, `api.openai.com`, `openrouter.ai`, `api.mistral.ai`, `models.github.ai`
+and `registry.ollama.ai` all fail to resolve or connect — and it cannot run a local
+model (2 vCPU, 3 GB RAM, no inference binary). Everything in this section is therefore
+verified against the repository's own test double, which speaks the same wire format
+but is not a model and produces no meaningful text.
+
+That means, precisely:
+
+- **verified here** — request construction, headers, retry and backoff, timeout
+  enforcement, usage and latency accounting, breaker transitions, cancellation,
+  the planning validation wall, degradation to local evidence, and the refusal gate;
+- **not verified here** — whether any real model's answers are accurate, relevant or
+  grounded; whether its token accounting matches what the adapter reports; whether a
+  provider's rate limits behave as documented; whether a model can be prompted into
+  proposing a dangerous step that the validation wall then has to reject in
+  production traffic.
+
+Do not read a green harness as a claim about answer quality, and do not read the
+stub's output as a model's.
+
+## 14. Deliberately not implemented
 
 - **Vision detection.** `context.visionContext` is client-reported data, passed through
   and labelled as such; when asked about it, RAVEN quotes what the page reported and
@@ -941,7 +1104,7 @@ is the whole test infrastructure — no Jest, no Vitest, nothing to install.
   implements it, and it is Phase 3 work on purpose: it changes the response contract.
 - **Storing raw provider traffic.** Only the answer text is persisted.
 
-## 14. Cost
+## 15. Cost
 
 | Path | Cost |
 | --- | --- |

@@ -14,7 +14,7 @@
  *  - If any of it throws, the caller still gets a well-formed response with a real
  *    error code. A portfolio backend that 500s on a clever question is a broken demo.
  */
-import { ravenConfig, type RavenConfig } from './config'
+import { providerUsable, ravenConfig, type RavenConfig } from './config'
 import { classifyIntent, judgeReferent } from './intent'
 import { tokenize } from './knowledge/search'
 import { routeTurn, type RouterCapabilities } from './router'
@@ -54,6 +54,13 @@ export type BrainOptions = {
   registry?: ToolRegistry
   /** Skip persistence entirely (used by the health probe and by pure-logic tests). */
   skipPersistence?: boolean
+  /**
+   * The HTTP request's own abort signal. It is forwarded to every provider call this turn makes, so a
+   * visitor who navigates away cancels the model request instead of letting it finish — on a metered
+   * endpoint an answer nobody will read is still a charge, and a retry loop that outlives the turn is
+   * still three of them.
+   */
+  signal?: AbortSignal
 }
 
 // The circuit breaker lives in `./breaker` so `system_status` can report it without importing
@@ -161,9 +168,10 @@ function memoryAnswer(match: { memory: MemoryRecord; hits: number; terms: number
 }
 
 function ungroundedNotice(config: RavenConfig): string {
-  const configured = Boolean(config.provider.id && config.provider.apiKeyPresent)
-  const why = configured
-    ? 'the configured provider did not answer this turn'
+  // `providerUsable`, not `apiKeyPresent`: a keyless local endpoint *is* configured, and telling the
+  // reader otherwise when it merely failed would send them hunting for a key that was never required.
+  const why = providerUsable(config)
+    ? `the model endpoint (${config.provider.label}${config.provider.model ? ` / ${config.provider.model}` : ''}) did not answer this turn`
     : 'no provider is configured, so nothing beyond this portfolio’s own records is available'
   return `Offline/local reasoning is active — ${why}. Ask about the projects, skills, experiments, contact details, or how this backend works.`
 }
@@ -171,8 +179,19 @@ function ungroundedNotice(config: RavenConfig): string {
 export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions = {}): Promise<RavenResponse> {
   const config = options.config ?? ravenConfig()
   const tracker = new Tracker()
+  // One controller watches every provider request this turn makes. It fires when the caller has given
+  // up (the route's signal), when the agentic budget expires, and when the turn is over. All three
+  // mean the same thing — an answer nobody will read — so all three cancel.
+  const turnAbort = new AbortController()
+  const clientSignal = options.signal
+  if (clientSignal) {
+    if (clientSignal.aborted) turnAbort.abort(clientSignal.reason)
+    else clientSignal.addEventListener('abort', () => turnAbort.abort(clientSignal.reason), { once: true })
+  }
   const conversationId = input.conversationId
   const message0 = typeof input.message === 'string' ? input.message : ''
+  // Set once the intent is classified; read by the genai branch to decide whether a model is asked.
+  let outOfScopeRequest = false
 
   const registry = options.registry ?? createToolRegistry(undefined, { stepTimeoutMs: config.limits.agentStepTimeoutMs })
   const runs: ToolRun[] = []
@@ -220,7 +239,14 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     intent: RavenIntent
     intentConfidence: number
     route: RouteDecision
-    provider: { id: string; label: string; model: string } | null
+    provider: {
+      id: string
+      label: string
+      model: string
+      ms?: number
+      usage?: { inputChars: number; outputChars: number; inputTokens?: number; outputTokens?: number }
+      context?: { chars: number; kept: number; dropped: number; dedupedChars: number }
+    } | null
     memory: { retrieved: number; stored: number }
     database: { driver: string; configured: boolean; reachable: boolean; detail: string }
     conversationSource: 'database' | 'file' | 'memory'
@@ -457,6 +483,10 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       })
     }
     const intent = resolved
+    // Scope is a property of the question, not of whichever engine happens to be configured. The
+    // classifier's `outside-scope` marker means the request points past these records, and the
+    // composer already refuses it — deciding here is what stops that refusal from depending on a key.
+    outOfScopeRequest = String(resolved.entities?.unanswerableByCorpus ?? '').includes('outside-scope')
 
     // The composer may only use names this repository actually documents; verification
     // checks the finished text against this vocabulary.
@@ -595,7 +625,17 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
     /** Set when a layer explained *why* it had nothing, so the refusal can be specific. */
     let ungroundedExplanation: string | null = null
     let citations: Citation[] = [...retrieval.citations]
-    let providerMeta: { id: string; label: string; model: string } | null = null
+    type ProviderMeta = {
+      id: string
+      label: string
+      model: string
+      /** The model's own round trip, so "the provider is slow" and "the pipeline is slow" are separable. */
+      ms?: number
+      /** What the call cost: characters always, tokens when the endpoint reports `usage`. */
+      usage?: { inputChars: number; outputChars: number; inputTokens?: number; outputTokens?: number }
+      context?: { chars: number; kept: number; dropped: number; dedupedChars: number }
+    }
+    let providerMeta: ProviderMeta | null = null
     let mode: RavenMode = route.mode
     let degradedFrom: RavenMode | undefined
     let degradedBecause: string | undefined
@@ -625,6 +665,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
           memories: context.memories,
           recent: context.recent,
           onRun: auditRuns,
+          signal: turnAbort.signal,
         })
           .then(
             (agentic) => ({ kind: 'ok' as const, agentic }),
@@ -636,6 +677,9 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         }),
       ])
       if (raced.kind !== 'ok') {
+        // The result is discarded either way, so stop the request rather than letting it finish for
+        // nobody: the model keeps generating, the transport keeps retrying, and the bill does not care.
+        if (!turnAbort.signal.aborted) turnAbort.abort(new Error(raced.kind === 'over' ? 'turn budget exceeded' : 'agentic path failed'))
         tracker.push('agent', undefined, raced.kind === 'over' ? `turn budget of ${budgetMs} ms exceeded; answered from retrieval` : `agentic path failed: ${clip(raced.error.message, 160)}`)
         degradedFrom = 'agentic'
         degradedBecause = raced.kind === 'over' ? `the ${budgetMs} ms turn budget ran out before the agent finished; answered from what retrieval had already returned` : raced.error.message
@@ -669,11 +713,16 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         providerMeta = agentic.provider ? { ...agentic.provider, ...(agentic.providerContext ? { context: agentic.providerContext } : {}) } : agentic.provider
         toolsUsed = [...new Set([...toolsUsed, ...agentic.toolsUsed])]
         stepRecords.push(...agentic.steps)
+        // A refusal that is only recorded in the database is a refusal that never happened. This note
+        // is metadata alone: tool names and validator reasons, never the prompt, never the model's prose.
+        if (agentic.planNotes.length) tracker.push('model-plan', undefined, agentic.planNotes.join('; '))
         if (agentic.synthesizedBy === 'deterministic') {
           degradedFrom = 'genai'
           degradedBecause = agentic.providerFailure ? `provider ${agentic.providerFailure.code}; synthesized from the same evidence locally` : 'no provider configured; synthesized from the same evidence locally'
         }
-        if (agentic.providerFailure) recordProviderFailure()
+        // `aborted` is this process giving up on a request, not the endpoint failing one. Opening the
+        // breaker because a visitor closed a tab would take the model away from the next ten people.
+        if (agentic.providerFailure && agentic.providerFailure.code !== 'aborted') recordProviderFailure()
         else if (agentic.synthesizedBy === 'provider') recordProviderSuccess()
       }
     } else if (route.mode === 'genai' && stored) {
@@ -690,7 +739,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
       stepRecords.push({ action: 'read durable memory', status: 'succeeded', ms: 0, note: `${composed.note}; provider call skipped` })
       // The VERIFYING phase above is already recorded as `memory-answer`; a second event for the same
       // decision reads like two things happened.
-    } else if (route.mode === 'genai') {
+    } else if (route.mode === 'genai' && !outOfScopeRequest) {
       tracker.enter('THINKING', 'provider-synthesis', provider ? `${provider.id}` : 'no provider resolved')
       const evidence = evidenceFromRetrieval(retrieval, message)
       const synthesis = await synthesizeWithProvider({
@@ -703,18 +752,30 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         task: 'Answer using only the SUPPLIED SOURCES for portfolio facts. Plain prose; no bullets unless a list was asked for.',
         json: false,
         mode: 'genai',
+        signal: turnAbort.signal,
       })
       const result = synthesis?.result
       if (result && result.ok) {
         answer = cleanReply(result.text)
-        providerMeta = { id: result.provider, label: provider?.label ?? result.provider, model: result.model, ...(synthesis ? { context: synthesis.contextReport } : {}) }
+        // `ms` is the model's own round trip and `usage` its token counts: the two numbers that
+        // separate "the provider is slow" from "this pipeline is slow", and the only way to see what a
+        // free tier is being spent on. Both are absent when the endpoint reported neither.
+        providerMeta = {
+          id: result.provider,
+          label: provider?.label ?? result.provider,
+          model: result.model,
+          ms: result.ms,
+          ...(result.usage ? { usage: result.usage } : {}),
+          ...(synthesis ? { context: synthesis.contextReport } : {}),
+        }
         citations.push({ kind: 'provider', source: `provider:${result.provider}/${result.model}`, label: 'Model answer, grounded in the retrieved portfolio records', quote: clip(answer ?? '', 300) })
         recordProviderSuccess()
         stepRecords.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms, note: `${result.provider}/${result.model}${synthesis ? `, prompt ${synthesis.promptChars} chars${synthesis.contextReport.dedupedChars ? `, ${synthesis.contextReport.dedupedChars} duplicate chars dropped` : ''}${synthesis.contextReport.dropped ? `, ${synthesis.contextReport.dropped} item(s) over budget` : ''}` : ''}` })
       } else {
         const code = result && !result.ok ? result.code : 'no_provider'
         const detail = result && !result.ok ? result.message : 'no provider resolved for this process'
-        recordProviderFailure()
+        // Same rule on the genai path: a cancelled turn is not a provider failure.
+        if (code !== 'aborted') recordProviderFailure()
         stepRecords.push({ action: 'synthesize with provider', status: 'failed', ms: result?.ms ?? 0, note: `${code}: ${clip(detail, 140)}` })
         const local = composeKnowledgeAnswer({ message, intent, retrieval, ...(memoryForAnswer ? { memory: memoryForAnswer } : {}), ...(navigation ? { navigation } : {}) })
         // A local fallback that also found nothing must not be presented as a knowledge
@@ -727,6 +788,15 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         degradedBecause = `${code}: ${clip(detail, 160)}`
       }
     } else {
+      if (outOfScopeRequest) {
+        // "The model was not asked" is something a reader has to be told: the same question with no
+        // endpoint configured refuses identically, and an unexplained skip reads as a failure. The note
+        // goes on the persisted step record *and* on the trace the response carries, because a
+        // deliberate refusal only the database can see is indistinguishable from a crash.
+        const skipReason = 'the classifier marked this question outside the portfolio records, so no model was asked; the refusal below is the same one this build gives with no endpoint configured'
+        stepRecords.push({ action: 'skip provider', status: 'skipped', ms: 0, note: skipReason })
+        tracker.push('provider-skip', undefined, skipReason)
+      }
       const local = composeKnowledgeAnswer({ message, intent, retrieval, ...(memoryForAnswer ? { memory: memoryForAnswer } : {}), ...(navigation ? { navigation } : {}) })
       // The composer can answer with an explanation of why it cannot answer. Taking that as a
       // `knowledge` reply was the semantic wart: the mode promised retrieved knowledge while
@@ -740,7 +810,7 @@ export async function runBrainTurn(input: BrainTurnInput, options: BrainOptions 
         // The router asked for knowledge; the layer returned "nothing grounded". Saying so in
         // `degraded` is what lets a log or a UI explain the turn without re-deriving it.
         degradedFrom = route.mode
-        degradedBecause = 'the composer found nothing grounded to say'
+        degradedBecause = outOfScopeRequest ? 'not attempted: the question is outside these records, so no model was asked and the refusal is the same one given with no endpoint' : 'the composer found nothing grounded to say'
       }
       if (local?.note) stepRecords.push({ action: 'compose', status: 'succeeded', ms: 0, note: local.note })
     }

@@ -26,6 +26,12 @@ export type RavenConfig = {
     maxRetries: number
     /** Only used by `openai` (local servers accept 0..2); clamped before use. */
     temperature: number
+    /**
+     * Let a configured model propose additional plan steps (validated server-side, read-only tools
+     * only). Off by default: it is one more provider request per agentic turn, and on a free tier
+     * that is a real cost the deterministic planner does not incur.
+     */
+    modelPlanning: boolean
     maxOutputTokens: number
     /** Address health checks for an unconfigured local model (see `detectLocalProvider`). */
     localProbeUrl: string
@@ -152,6 +158,7 @@ export function ravenConfig(): RavenConfig {
       timeoutMs: int('RAVEN_TIMEOUT_MS', 25_000),
       maxRetries: Math.min(3, int('RAVEN_MAX_RETRIES', 2)),
       temperature: Math.max(0, Math.min(2, Number(env('RAVEN_TEMPERATURE') ?? 0.35))),
+      modelPlanning: env('RAVEN_MODEL_PLANNING') === '1',
       maxOutputTokens: int('RAVEN_MAX_OUTPUT_TOKENS', 1024),
     },
     limits: {
@@ -211,6 +218,8 @@ export type RavenCapabilities = {
   providerModel: string | null
   /** True when the brain can talk to a provider at all (implementation exists). */
   providerAdapterImplemented: boolean
+  /** Whether an agentic turn may spend a second request on model-assisted planning (`RAVEN_MODEL_PLANNING=1`). */
+  modelPlanning: boolean
   databaseConfigured: boolean
   databaseRestConfigured: boolean
   databaseDriver: DatabaseDriver
@@ -222,13 +231,23 @@ export type RavenCapabilities = {
   envVars: string[]
 }
 
+/**
+ * Could this process call a model right now? An endpoint is named, a model is named, and either a
+ * credential exists or the endpoint is an OpenAI-compatible surface that is allowed to have none.
+ * One definition, because the offline notice and the health report must not disagree about it.
+ */
+export function providerUsable(config = ravenConfig()): boolean {
+  return Boolean(config.provider.id && config.provider.model && (config.provider.apiKeyPresent || Boolean(config.provider.baseUrl)))
+}
+
 export function describeCapabilities(config = ravenConfig()): RavenCapabilities {
   return {
     providerConfigured: Boolean(config.provider.id && config.provider.apiKeyPresent),
     // `id` is only non-null with a credential or a non-Google base URL, so this is "an endpoint was
     // named", not "a key was found" — and `resolveProvider` remains the single authority on whether
     // a provider object can be built from it.
-    providerUsable: Boolean(config.provider.id && config.provider.model && (config.provider.apiKeyPresent || Boolean(config.provider.baseUrl))),
+    providerUsable: providerUsable(config),
+    modelPlanning: config.provider.modelPlanning,
     providerId: config.provider.id,
     providerLabel: config.provider.label,
     providerModel: config.provider.model,
@@ -257,6 +276,9 @@ export function describeCapabilities(config = ravenConfig()): RavenCapabilities 
       'RAVEN_TIMEOUT_MS',
       'RAVEN_MAX_RETRIES',
       'RAVEN_MAX_OUTPUT_TOKENS',
+      'RAVEN_MODEL_PLANNING',
+      'RAVEN_BREAKER_THRESHOLD',
+      'RAVEN_BREAKER_COOLDOWN_MS',
       'DATABASE_URL',
       'SUPABASE_URL',
       'SUPABASE_DB_KEY',

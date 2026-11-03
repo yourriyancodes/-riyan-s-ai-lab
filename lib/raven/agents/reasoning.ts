@@ -17,6 +17,7 @@ import type { RavenConfig } from '../config'
 import type { ModelProvider } from '../types'
 import type { RetrievalResult } from './research'
 import { callSignature } from '../tools/registry'
+import { planWithModel } from './plannerModel'
 import type { ToolContext, ToolRegistry } from '../tools/registry'
 import { buildMessages, cleanReply, extractJsonObject } from '../providers/prompt'
 import type { GroundingInput } from '../providers/prompt'
@@ -30,6 +31,8 @@ export type PlanStep = {
   tool: string
   input: Record<string, unknown>
   action?: string
+  /** Why this step is in the plan — from the gap table, or from the model's own proposal. */
+  why?: string
 }
 
 export type AgenticInput = {
@@ -38,6 +41,8 @@ export type AgenticInput = {
   retrieval: RetrievalResult
   registry: ToolRegistry
   context: ToolContext
+  /** The HTTP request's own abort signal: a visitor who navigated away stops costing requests. */
+  signal?: AbortSignal
   config: RavenConfig
   provider: ModelProvider | null
   memories: MemoryRecord[]
@@ -55,10 +60,16 @@ export type AgenticResult = {
   runs: ToolRun[]
   toolsUsed: string[]
   synthesizedBy: 'provider' | 'deterministic'
-  provider: { id: string; label: string; model: string; ms: number } | null
+  provider: { id: string; label: string; model: string; ms: number; usage?: { inputChars: number; outputChars: number; inputTokens?: number; outputTokens?: number } } | null
   /** What the packed prompt actually contained, so "the model was not told X" is checkable. */
   providerContext?: { chars: number; kept: number; dropped: number; dedupedChars: number }
   providerFailure: { code: string; message: string } | null
+  /**
+   * Why the plan is what it is, in the order a reader needs it: what the model proposed, what the
+   * validator refused and for what reason, what was dropped as already gathered. Surfaced as a trace
+   * note so a rejection is never invisible to whoever is inspecting the turn.
+   */
+  planNotes: string[]
   evidence: EvidenceDocument[]
 }
 
@@ -159,6 +170,8 @@ export async function synthesizeWithProvider(input: {
   task: string
   json?: boolean
   mode: RavenMode
+  /** Forwarded to the transport so a cancelled turn cancels the HTTP request. */
+  signal?: AbortSignal
 }): Promise<{ result: ProviderResult; promptChars: number; contextReport: { chars: number; kept: number; dropped: number; dedupedChars: number } } | null> {
   if (!input.provider) return null
   const sources: RetrievedDocument[] = input.evidence.map((document) => ({
@@ -187,6 +200,7 @@ export async function synthesizeWithProvider(input: {
     temperature: input.config.provider.temperature,
     maxOutputTokens: input.config.provider.maxOutputTokens,
     ...(input.json ? { json: true } : {}),
+    ...(input.signal ? { signal: input.signal } : {}),
   })
   return { result: outcome, promptChars: built.usedChars, contextReport }
 }
@@ -203,7 +217,50 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
   // comparison needs a second with a different one. What stays blocked is the identical call.
   const alreadyRan = new Set<string>(input.retrieval.signatures ?? [...input.retrieval.outcomes.keys()].map((key) => key.split('#')[0]!))
   const plan = planAgentSteps({ intent: input.intent, message: input.message, alreadyRan })
+  const planNotes: string[] = []
   const maxSteps = input.config.limits.agentMaxSteps
+
+  // Opt-in model-assisted planning. Accepted proposals run *first* and the deterministic gap rules
+  // still fill the remaining slots, so a proposal can change what gets looked up but a broken or
+  // hostile one cannot take the turn below what the table alone would have gathered.
+  if (input.config.provider.modelPlanning && input.provider) {
+    const proposed = await planWithModel({
+      provider: input.provider,
+      config: input.config,
+      registry: input.registry,
+      message: input.message,
+      intent: input.intent,
+      evidenceTitles: input.retrieval.citations.map((citation) => citation.label),
+      alreadyRan,
+      maxSteps: Math.max(1, maxSteps - plan.steps.length),
+      ...(input.signal ? { signal: input.signal } : {}),
+    })
+    if (proposed.steps.length) {
+      plan.steps = [...proposed.steps, ...plan.steps].slice(0, maxSteps).map((step, index) => ({ ...step, id: `agent-step-${index + 1}` }))
+    }
+    const detail = [
+      `${proposed.steps.length} accepted, ${proposed.rejected.length} rejected`,
+      ...proposed.rejected.slice(0, 3).map((rejection) => `${rejection.tool}: ${clip(rejection.reason, 70)}`),
+      ...(proposed.notes.length ? [`${proposed.notes.length} dropped as already gathered`] : []),
+    ].join('; ')
+    steps.push({
+      action: 'plan with model',
+      // 'succeeded' means the plan was usable, rejections included — a proposal refused by the
+      // validator is the validator working, not a failure. 'failed' is reserved for the case where
+      // nothing usable came back and the deterministic plan is what actually ran.
+      status: proposed.ok || proposed.steps.length ? 'succeeded' : 'failed',
+      ms: proposed.ms,
+      note: proposed.ok ? clip(detail, 300) : clip(`kept the deterministic plan (${proposed.failure ?? 'no usable reply'}); ${detail}`, 300),
+    })
+    // Refusals first, tally last. The trace note this becomes is clipped to 200 chars, and the two
+    // things a reader has to see are which proposals were refused and why — the count is the least of
+    // it. The full list also rides on the persisted run, so nothing is lost to the clip.
+    for (const rejection of proposed.rejected) planNotes.push(`refused ${rejection.tool}: ${rejection.reason}`)
+    for (const note of proposed.notes) planNotes.push(`dropped ${note}`)
+    // The tally goes first only in the *step record* (`detail`); here the refusals lead, because this
+    // note is what the response shows and it is clipped.
+    planNotes.push(`model planning: ${proposed.ok ? `${proposed.steps.length} accepted, ${proposed.rejected.length} refused` : `kept the deterministic plan (${proposed.failure ?? 'no usable reply'})`}`)
+  }
 
   for (const step of plan.steps.slice(0, maxSteps)) {
     const started = Date.now()
@@ -228,7 +285,7 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
       tool: step.tool,
       status: outcome.status,
       ms: outcome.ms,
-      ...(outcome.error ? { note: clip(outcome.error, 160) } : {}),
+      note: [step.why ? `why: ${clip(step.why, 120)}` : '', outcome.error ? clip(outcome.error, 160) : ''].filter(Boolean).join(' — ') || undefined,
     })
   }
 
@@ -257,6 +314,7 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
       task,
       json: true,
       mode: 'agentic',
+      ...(input.signal ? { signal: input.signal } : {}),
     })
     const started = Date.now()
     if (synthesis) {
@@ -266,7 +324,7 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
         const parsed = extractJsonObject(result.text)
         const candidate = typeof parsed?.answer === 'string' ? parsed.answer : result.text
         answer = cleanReply(candidate)
-        provider = { id: result.provider, label: input.provider.label, model: result.model, ms: result.ms }
+        provider = { id: result.provider, label: input.provider.label, model: result.model, ms: result.ms, ...(result.usage ? { usage: result.usage } : {}) }
         synthesizedBy = 'provider'
         citations.push({ kind: 'provider', source: `provider:${result.provider}/${result.model}`, label: 'Model synthesis over the retrieved evidence', quote: clip(answer ?? '', 300) })
         steps.push({ action: 'synthesize with provider', status: 'succeeded', ms: result.ms || Date.now() - started, note: `${result.provider}/${result.model}, prompt ${synthesis.promptChars} chars${synthesis.contextReport.dedupedChars ? `, ${synthesis.contextReport.dedupedChars} duplicate chars removed` : ''}${synthesis.contextReport.dropped ? `, ${synthesis.contextReport.dropped} item(s) over budget` : ''}` })
@@ -291,6 +349,7 @@ export async function runAgenticTurn(input: AgenticInput): Promise<AgenticResult
     synthesizedBy,
     provider,
     providerFailure,
+    planNotes,
     evidence,
     ...(synthesisContext ? { providerContext: synthesisContext } : {}),
   }

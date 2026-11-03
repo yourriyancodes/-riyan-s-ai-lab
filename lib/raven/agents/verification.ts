@@ -202,6 +202,37 @@ export function verifyAnswer(input: VerifyInput): VerificationReport {
     checks.push({ name: 'no-unused-provider', ok: false, note: 'a provider result exists but the mode says knowledge', blocking: true })
   }
 
+  // Fluency is not relevance. A model can write a well-formed paragraph about the wrong project and
+  // every check above passes, because they look for *contradiction* with the evidence, not for
+  // *aboutness*. This is the cheapest proxy that can be computed server-side: the share of answer
+  // sentences carrying at least one content word from the evidence. It stays advisory on purpose —
+  // overlap is neither necessary nor sufficient for correctness, and turning it into a verdict would
+  // replace one unfounded confidence with another. It never touches `verified`; its job is to leave
+  // "fluent, but about something else" in the trace and in the model harness where a human reads it.
+  if (input.mode !== 'offline' && answer.length > 160) {
+    const STOP = new Set(['about', 'after', 'again', 'also', 'because', 'being', 'between', 'build', 'can', 'could', 'does', 'down', 'each', 'from', 'have', 'into', 'its', 'just', 'like', 'made', 'make', 'more', 'most', 'much', 'not', 'only', 'other', 'over', 'same', 'should', 'some', 'such', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'used', 'uses', 'very', 'when', 'where', 'which', 'while', 'with', 'would', 'your', 'what', 'whose'])
+    // Interior dots survive (Next.js is one term); terminal ones do not, or "citations." would never
+    // match the "citations" that ended the evidence sentence.
+    const termsIn = (text: string) =>
+      new Set(text.toLowerCase().split(/[^a-z0-9+#.-]+/).map((word) => word.replace(/^\.+|\.+$/g, '')).filter((word) => word.length >= 5 && !STOP.has(word)))
+    const evidenceTerms = termsIn(input.evidenceText)
+    const sentences = answer
+      .split(/(?<=[.!?])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter((sentence) => sentence.split(/\s+/).length >= 6)
+    if (evidenceTerms.size >= 8 && sentences.length >= 3) {
+      const offTopic = sentences.filter((sentence) => ![...termsIn(sentence)].some((term) => evidenceTerms.has(term)))
+      checks.push({
+        name: 'topicality-advisory',
+        ok: offTopic.length === 0,
+        note: offTopic.length
+          ? `${offTopic.length} of ${sentences.length} answer sentence(s) share no content term with the retrieved evidence — advisory only: overlap cannot prove an answer is about the right thing, and a fluent reply about the wrong subject would still be flagged here by nothing else`
+          : `all ${sentences.length} sentence(s) share a term with the evidence (advisory: overlap is not proof of correctness)`,
+        blocking: false,
+      })
+    }
+  }
+
   const truncatedRuns = input.runs.filter((run) => run.error?.includes('truncated'))
   if (truncatedRuns.length) {
     checks.push({ name: 'tool-output-size', ok: true, note: `${truncatedRuns.length} tool output(s) were truncated before synthesis`, blocking: false })

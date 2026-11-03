@@ -100,6 +100,9 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
         body,
         timeoutMs: options.timeoutMs,
         retries: options.maxRetries ?? 0,
+        // The turn's deadline reaches the transport. Retries stay enabled because the signal now stops
+        // the backoff too, which is what makes retrying safe on a metered endpoint.
+        ...(request.signal ? { signal: request.signal } : {}),
         sleep: options.sleep,
       })
       if (!response.ok) return failure(response)

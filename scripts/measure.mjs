@@ -9,6 +9,10 @@
  *   node scripts/measure.mjs phases  [--port 3102] [--rounds 5]   where those milliseconds go
  *   node scripts/measure.mjs micro                                 in-process floors (no server)
  *   node scripts/measure.mjs context                               what each prompt is made of
+ *   node scripts/measure.mjs model   [--port 3102] [--stub] [--direct]
+ *                                                                  the six contract cases against a
+ *                                                                  live endpoint, with the failure
+ *                                                                  matrix when --stub is in play
  *
  * `turns` and `phases` need a running instance (any driver, provider optional) and say so when
  * there is none. `micro` and `context` run against the source and measure the deterministic engine
@@ -221,5 +225,16 @@ if (command === 'context') {
   process.exit(0)
 }
 
-console.error(`unknown command "${command}" — expected turns | phases | micro | context`)
+if (command === 'model') {
+  const { runModelHarness } = await import('./lib/measure-model.mjs')
+  await runModelHarness({
+    port,
+    host: flag('host', '127.0.0.1'),
+    stub: argv.includes('--stub'),
+    direct: argv.includes('--direct'),
+    repeat: Number(flag('repeat', 1)),
+  })
+}
+
+console.error(`unknown command "${command}" — expected turns | phases | micro | context | model`)
 process.exit(2)

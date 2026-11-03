@@ -70,15 +70,26 @@ const server = createServer((req, res) => {
     // health probe would report the endpoint as authorized while every completion kept failing.
     if (/BADKEY/.test(String(req.headers.authorization ?? ''))) return json(res, 401, { error: { message: 'Incorrect API key provided.' } })
     if (/RATE LIMIT ME/i.test(prompt)) {
+      console.log(`call#${calls} refused=429 retry-after=1`)
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' })
       return res.end(JSON.stringify({ error: { message: 'Rate limit exceeded. Slow down.' } }))
     }
-    if (/FAIL THE MODEL/i.test(prompt)) return json(res, 500, { error: { message: 'upstream exploded' } })
+    if (/FAIL THE MODEL/i.test(prompt)) {
+      console.log(`call#${calls} refused=500`)
+      return json(res, 500, { error: { message: 'upstream exploded' } })
+    }
     if (/GIBBERISH INSTEAD/i.test(prompt)) {
+      console.log(`call#${calls} body=not-json`)
       res.writeHead(200, { 'content-type': 'application/json' })
       return res.end('<html>not json at all</html>')
     }
-    if (/MAKE IT HANG/i.test(prompt)) return // deliberately never answers
+    if (/MAKE IT HANG/i.test(prompt)) {
+      // The socket stays open and the client's timeout is what ends the exchange. Logged because a
+      // request the endpoint never answered still happened, and a harness counting only answered
+      // requests would report the timeout case as "no request was made".
+      console.log(`call#${calls} hanging=1`)
+      return
+    }
 
     // Two sentences, picked by whether the caller's context contained the remembered preference.
     // That is the whole point: it proves *something arrived in the prompt*, which is what the
