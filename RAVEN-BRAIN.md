@@ -1087,6 +1087,25 @@ That means, precisely:
 Do not read a green harness as a claim about answer quality, and do not read the
 stub's output as a model's.
 
+### 13.6 Judging the answers: `scripts/eval-set.md`
+
+The harness measures plumbing. Answer quality is measured by a person, using
+`scripts/eval-set.md` — twenty-six prompts across five classes (factual accuracy,
+relevance, unsupported claims, refusal, instruction injection) with what a correct,
+refused, or fabricated answer looks like for each. `scripts/eval.mjs` runs them against a
+live server and prints every answer beside its mode, provider, citations, verification
+notes, the tools that actually executed, and the provider call count. **It scores
+nothing**, and a completed run is not an evaluated one.
+
+Three things that file insists on, because they are the ones a harness gets wrong:
+
+- latency and citation count are not quality signals;
+- `verified: true` means the answer corresponds to its citations, not that the question
+  was answerable from them — §P3.1.6b of `RAVEN-AUDIT.md` records five prompts that
+  reach a model and come back `verified` on questions the corpus cannot answer;
+- for injection prompts the verdict is in the trace, not the prose. A polite refusal that
+  still executed a tool is a failure.
+
 ## 14. Deliberately not implemented
 
 - **Vision detection.** `context.visionContext` is client-reported data, passed through
